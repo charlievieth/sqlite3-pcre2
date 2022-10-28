@@ -2,24 +2,20 @@
 
 #include <sqlite3.h>
 #include <sqlite3ext.h>
-#include <sys/_types/_size_t.h>
-#include <sys/_types/_ssize_t.h>
 SQLITE_EXTENSION_INIT1
 
 #define PCRE2_CODE_UNIT_WIDTH 8
 #include <pcre2.h>
 
-// WARN: dev only
-#include <stdio.h>
-
 // TODO: make sure we need all of these
 #include <stdlib.h>
-#include <stddef.h>
 #include <string.h>
+#include <stdarg.h>
 #include <ctype.h>
 #include <stdbool.h>
-#include <limits.h>
 #include <assert.h>
+
+#include "hedley.h"
 
 #ifndef CACHE_SIZE
 #define CACHE_SIZE 16
@@ -29,8 +25,17 @@ SQLITE_EXTENSION_INIT1
 // unless changed to use a hash map).
 static_assert(1 <= CACHE_SIZE && CACHE_SIZE <= 1024, "invalid CACHE_SIZE");
 
+#ifndef JIT_STACK_START_SIZE
+#define JIT_STACK_START_SIZE (32 * 1024)
+#endif
+#ifndef JIT_STACK_MAX_SIZE
+#define JIT_STACK_MAX_SIZE (512 * 1024)
+#endif
+
+#define noinline HEDLEY_NEVER_INLINE
+
 #ifndef unlikely
-#define unlikely(x) __builtin_expect(!!(x), 0)
+#define unlikely(x) HEDLEY_UNLIKELY(x)
 #endif
 
 #ifdef _WIN32
@@ -40,13 +45,14 @@ static_assert(1 <= CACHE_SIZE && CACHE_SIZE <= 1024, "invalid CACHE_SIZE");
 #endif
 
 // malloc wrapper for pcre2
-static void *wrapped_malloc(size_t size, void *data) {
+HEDLEY_MALLOC
+static void *re_malloc(size_t size, void *data) {
 	(void)data;
 	return sqlite3_malloc64(size);
 }
 
 // free wrapper for pcre2
-static void wrapped_free(void *block, void *data) {
+static void re_free(void *block, void *data) {
 	(void)data;
 	sqlite3_free(block);
 }
@@ -96,6 +102,7 @@ static inline bool cache_entry_match(const cache_entry *e, const char *ptrn,
 	          memcmp(e->pattern, ptrn, plen) == 0);
 }
 
+// TODO: make thread-safe
 // cache_list is a doubly linked list of compiled pcre2 codes
 typedef struct cache_list {
 	cache_entry root;
@@ -125,21 +132,23 @@ static inline void cache_list_move(cache_entry *e, cache_entry *at) {
 	e->next->prev = e;
 }
 
-// TODO: rename to 'cache_list_move_front'
-static inline void cache_list_push_front(cache_list *l, cache_entry *e) {
-	// WARN: make sure we don't keep growing the list with
-	// the same set of entires (check length).
+static inline void cache_list_move_front(cache_list *l, cache_entry *e) {
 	cache_list_move(e, &l->root);
 }
 
-static inline void cache_list_push_back(cache_list *l, cache_entry *e) {
+static inline void cache_list_move_back(cache_list *l, cache_entry *e) {
 	if (l->root.prev == e) {
 		return;
 	}
 	cache_list_move(e, l->root.prev);
 }
 
-// TODO: rename ???
+// cache_list_discard frees the cache_entry and places it in the back of the list.
+static inline void cache_list_discard(cache_list *l, cache_entry *e) {
+	cache_entry_free(e);
+	cache_list_move_back(l, e);
+}
+
 static cache_list *cache_list_init(void) {
 	cache_list *list = sqlite3_malloc64(sizeof(cache_list));
 	if (!list) {
@@ -147,18 +156,23 @@ static cache_list *cache_list_init(void) {
 	}
 	memset(list, 0, sizeof(cache_list));
 
-	// WARN: error handling
-
 	// clang-format off
 	list->general_context = pcre2_general_context_create(
-		wrapped_malloc,
-		wrapped_free,
+		re_malloc,
+		re_free,
 		NULL
 	);
+	if (!list->general_context) {
+		goto error;
+	}
+
 	// clang-format off
 	list->compile_context = pcre2_compile_context_create(
 		list->general_context
 	);
+	if (!list->compile_context) {
+		goto error;
+	}
 
 	list->root.next = &list->root;
 	list->root.prev = &list->root;
@@ -166,6 +180,16 @@ static cache_list *cache_list_init(void) {
 		cache_list_insert(&list->data[i], &list->root);
 	}
 	return list;
+
+error:
+	if (list->general_context) {
+		pcre2_general_context_free(list->general_context);
+	}
+	if (list->compile_context) {
+		pcre2_compile_context_free(list->compile_context);
+	}
+	sqlite3_free(list);
+	return NULL;
 }
 
 static void cache_list_destroy(cache_list *list) {
@@ -190,10 +214,10 @@ static cache_entry *cache_list_find(cache_list *l, const char *ptrn,
                                     size_t plen) {
 	for (cache_entry *e = l->root.next; e != &l->root; e = e->next) {
 		if (e->pattern == NULL) {
-			break; // WARN: this should work
+			break;
 		}
 		if (cache_entry_match(e, ptrn, plen)) {
-			cache_list_push_front(l, e);
+			cache_list_move_front(l, e);
 			return e;
 		}
 	}
@@ -205,14 +229,14 @@ static cache_entry *cache_list_next(cache_list *l) {
 	// TODO: could check the last entry first
 	for (cache_entry *e = l->root.next; e != &l->root; e = e->next) {
 		if (e->pattern == NULL) {
-			cache_list_push_front(l, e);
+			cache_list_move_front(l, e);
 			return e; // WARN: this should work
 		}
 	}
 	cache_entry *e = l->root.prev;
 	assert(e != &l->root); // TODO: remove
 	cache_entry_reset(e);
-	cache_list_push_front(l, e);
+	cache_list_move_front(l, e);
 	return e;
 }
 
@@ -286,19 +310,57 @@ static bool starts_with_upper(const char *s) {
 	return false;
 }
 
-static void handle_regexp_compile_error(sqlite3_context *ctx,
-										int errcode,
-                                        size_t offset,
-	                                    const char *pattern) {
+HEDLEY_PRINTF_FORMAT(1, 2)
+static char *re_mprintf(const char *format, ...) {
+	va_list args;
+	va_start(args, format);
+	char *msg = sqlite3_vmprintf(format, args);
+	va_end(args);
+	return msg;
+}
+
+// static noinline void handle_regexp_error(sqlite3_context *ctx, int errcode,
+//                                          const char *format, ...) {
+// 	const int bufsz = 128;
+// 	char buf[bufsz];
+//
+// 	int ret = pcre2_get_error_message(errcode, (PCRE2_UCHAR *)&buf[0], bufsz);
+// 	if (ret == PCRE2_ERROR_BADDATA) {
+// 		strcpy(&buf[0], "<invalid>");
+// 	}
+//
+// 	va_list args;
+// 	va_start(args, format);
+// 	char *umsg = sqlite3_vmprintf(format, args);
+// 	va_end(args);
+// 	if (!umsg) {
+// 		// WTF
+// 	}
+// 	char *msg = sqlite3_mprintf("%s: %s", umsg, &buf[0]);
+// 	sqlite3_free(umsg);
+// }
+
+static noinline void handle_regexp_compile_error(
+	sqlite3_context *ctx,
+	int errcode,
+    size_t offset,
+	const char *pattern
+) {
 	const int bufsz = 128;
 	char buf[bufsz];
+	if (errcode == PCRE2_ERROR_NOMEMORY) {
+		sqlite3_result_error_nomem(ctx);
+	}
 
 	int ret = pcre2_get_error_message(errcode, (PCRE2_UCHAR *)&buf[0], bufsz);
 	if (ret == PCRE2_ERROR_BADDATA) {
 		strcpy(&buf[0], "<invalid>");
 	}
 
-	char *msg = sqlite3_mprintf("%s: %s (offset %llu)", pattern, &buf[0],
+	// char *msg = sqlite3_mprintf("%s: %s (offset %llu)", pattern, &buf[0],
+	//                             (uint64_t)offset);
+
+	char *msg = re_mprintf("%s: %s (offset %llu)", pattern, &buf[0],
 	                            (uint64_t)offset);
 	if (msg) {
 		sqlite3_result_error(ctx, msg, -1);
@@ -308,9 +370,12 @@ static void handle_regexp_compile_error(sqlite3_context *ctx,
 	}
 }
 
-static void handle_regexp_match_error(sqlite3_context *ctx, int errcode,
-                                      const char *pattern,
-                                      const char *subject) {
+static noinline void handle_regexp_match_error(
+	sqlite3_context *ctx,
+	int errcode,
+    const char *pattern,
+    const char *subject
+) {
 	const int bufsz = 128;
 	char buf[bufsz];
 
@@ -331,8 +396,83 @@ static void handle_regexp_match_error(sqlite3_context *ctx, int errcode,
 	}
 }
 
+static cache_entry *regexp_compile(sqlite3_context *ctx, cache_list *cache,
+	                               const char *pattern, size_t pattern_len) {
+
+	uint32_t options = PCRE2_MULTILINE;
+	if (has_non_ascii(pattern)) {
+		options |= (PCRE2_UTF | PCRE2_MATCH_INVALID_UTF);
+	}
+	// if (!case_sensitive(re)) {
+	// 	options |= PCRE2_CASELESS;
+	// }
+
+	cache_entry *ent = NULL;
+	int errcode;
+	size_t errpos;
+
+	// clang-format off
+	pcre2_code *code = pcre2_compile((PCRE2_SPTR)pattern, pattern_len, options,
+	                                 &errcode, &errpos, cache->compile_context);
+	if (unlikely(code == NULL)) {
+		handle_regexp_compile_error(ctx, errcode, errpos, pattern);
+		return NULL;
+	}
+	// WARN: ignoring error
+	pcre2_jit_compile(code, PCRE2_JIT_COMPLETE);
+
+	// WARN: ignoring error
+	uint32_t ovecsize = 0;
+	pcre2_pattern_info(code, PCRE2_INFO_CAPTURECOUNT, &ovecsize);
+
+	pcre2_match_data *match_data = pcre2_match_data_create(
+		ovecsize, cache->general_context
+	);
+	if (unlikely(match_data == NULL)) {
+		goto err_nomem;
+	}
+
+	// TODO: combine find and next
+	ent = cache_list_next(cache);
+	ent->code = code;
+	ent->match_data = match_data;
+
+	// TODO: use a thread local variable and callback for the JIT stack.
+	if (ent->jit_stack == NULL) {
+		// clang-format off
+		ent->jit_stack = pcre2_jit_stack_create(
+			JIT_STACK_START_SIZE,
+			JIT_STACK_MAX_SIZE,
+			cache->general_context
+		);
+		ent->context = pcre2_match_context_create(cache->general_context);
+		if (unlikely(ent->jit_stack == NULL || ent->context == NULL)) {
+			goto err_nomem;
+		}
+		pcre2_jit_stack_assign(ent->context, NULL, ent->jit_stack);
+	}
+
+	ent->pattern = sqlite3_malloc64(pattern_len + 1);
+	if (unlikely(ent->pattern == NULL)) {
+		goto err_nomem;
+	}
+	memcpy(ent->pattern, pattern, pattern_len + 1);
+	ent->pattern_len = pattern_len;
+
+	return ent;
+
+err_nomem:
+	if (code) {
+		pcre2_code_free(code);
+	}
+	if (ent) {
+		cache_list_discard(cache, ent);
+	}
+	sqlite3_result_error_nomem(ctx);
+	return NULL;
+}
+
 static void regexp(sqlite3_context *ctx, int argc, sqlite3_value **argv) {
-	assert(argc == 2);
 	if (argc != 2) {
 		sqlite3_result_error(ctx, "regexp: invalid number of arguments", -1);
 		return;
@@ -342,8 +482,9 @@ static void regexp(sqlite3_context *ctx, int argc, sqlite3_value **argv) {
 		sqlite3_result_error(ctx, "regexp: NULL regex pattern", -1);
 		return;
 	}
+
+	// NULL values never match
 	if (sqlite3_value_type(argv[1]) == SQLITE_NULL) {
-		// WARN: test with NULLs to make sure this is the correct behavior
 		sqlite3_result_int(ctx, 0);
 		return;
 	}
@@ -365,81 +506,19 @@ static void regexp(sqlite3_context *ctx, int argc, sqlite3_value **argv) {
 	}
 
 	cache_list *cache = sqlite3_user_data(ctx);
-	assert(cache);
 	if (unlikely(cache == NULL)) {
-		sqlite3_result_error(ctx, "regexp: internal error: missing regex cache",
-		                     -1);
+		sqlite3_result_error(ctx, "regexp: internal error: missing regex cache", -1);
 		return;
 	}
 
+	// TODO: combine `cache_list_find` and `cache_list_next`
 	cache_entry *ent = cache_list_find(cache, pattern, pattern_len);
 	if (ent == NULL) {
-		uint32_t options = PCRE2_MULTILINE;
-		if (has_non_ascii(pattern)) {
-			options |= (PCRE2_UTF | PCRE2_MATCH_INVALID_UTF);
-		}
-		// if (!case_sensitive(re)) {
-		// 	options |= PCRE2_CASELESS;
-		// }
-
-		int errcode;
-		size_t errpos;
-		// clang-format off
-		pcre2_code *code = pcre2_compile((PCRE2_SPTR)pattern, pattern_len, options,
-		                                 &errcode, &errpos, cache->compile_context);
-		assert(code); // WARN
-		if (unlikely(code == NULL)) {
-			handle_regexp_compile_error(ctx, errcode, errpos, pattern);
+		ent = regexp_compile(ctx, cache, pattern, pattern_len);
+		if (unlikely(ent == NULL)) {
 			return;
 		}
-		// WARN: ignoring error
-		pcre2_jit_compile(code, PCRE2_JIT_COMPLETE);
-
-		uint32_t ovecsize = 0;
-		int rc = pcre2_pattern_info(code, PCRE2_INFO_CAPTURECOUNT, &ovecsize);
-		if (unlikely(rc != 0)) {
-			pcre2_code_free(code);
-			sqlite3_result_error(ctx, "regexp: pcre2_pattern_info", -1);
-			return;
-		}
-
-		pcre2_match_data *match_data = pcre2_match_data_create(ovecsize, cache->general_context);
-		if (unlikely(match_data == NULL)) {
-			pcre2_code_free(code);
-			sqlite3_result_error_nomem(ctx);
-			return;
-		}
-
-		// TODO: combine find and next
-		ent = cache_list_next(cache);
-		assert(ent);
-		ent->code = code;
-		ent->match_data = match_data;
-
-		// TODO: do we really want to reuse the jit_stack ???
-		if (ent->jit_stack == NULL) {
-			ent->jit_stack = pcre2_jit_stack_create(32 * 1024, 512 * 1024, cache->general_context);
-			ent->context = pcre2_match_context_create(cache->general_context);
-			if (unlikely(ent->jit_stack == NULL || ent->context == NULL)) {
-				cache_entry_free(ent);
-				cache_list_push_back(cache, ent);
-				sqlite3_result_error_nomem(ctx);
-				return;
-			}
-			pcre2_jit_stack_assign(ent->context, NULL, ent->jit_stack);
-		}
-
-		ent->pattern_len = pattern_len;
-		ent->pattern = sqlite3_malloc64(pattern_len + 1);
-		if (unlikely(ent->pattern == NULL)) {
-			cache_entry_free(ent);
-			cache_list_push_back(cache, ent);
-			sqlite3_result_error_nomem(ctx);
-			return;
-		}
-		memcpy(ent->pattern, pattern, pattern_len + 1);
 	}
-	assert(ent);
 
 	// TODO: handle zero length subjects?
 	size_t subject_len = sqlite3_value_bytes(argv[1]);
@@ -453,7 +532,7 @@ static void regexp(sqlite3_context *ctx, int argc, sqlite3_value **argv) {
 
 	// WARN: should probably be rc > 0 (rc == 0 when ovec size not big enough,
 	// but is that a match)?
-	sqlite3_result_int(ctx, rc >= 0);
+	sqlite3_result_int(ctx, !!(rc >= 0));
 	return;
 }
 
