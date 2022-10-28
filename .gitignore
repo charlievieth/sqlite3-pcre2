@@ -1,0 +1,9 @@
+/*.sqlite3
+/.cache
+/tmp
+*.dylib
+*.dylib.dSYM
+*.plist
+.clang-format
+compile_commands.json
+tags
