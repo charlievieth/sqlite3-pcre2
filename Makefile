@@ -1,36 +1,75 @@
-VERSION=0.1.1
-CC=cc
+# vim: ts=4 sw=4
+
+MAJVER=  0
+MINVER=  0
+RELVER=  1
+PREREL=
+VERSION= $(MAJVER).$(MINVER).$(RELVER)$(PREREL)
+
+##############################################################################
+#
+# Change the installation path as needed. This automatically adjusts
+# the paths in src/luaconf.h, too. Note: PREFIX must be an absolute path!
+#
+export PREFIX= /usr/local
+export MULTILIB= lib
+##############################################################################
+
+DEFAULT_CC = gcc
+CC= $(DEFAULT_CC)
+
+RM= rm -f
+MKDIR= mkdir -p
+RMDIR= rm -rf
+SYMLINK= ln -sf
+INSTALL_X= install -m 0755
+INSTALL_F= install -m 0644
+UNINSTALL= $(RM)
 INSTALL=install
-HOST_SYS:= $(shell uname -s)
-prefix=/usr/local
+
+ifeq (,$(findstring Windows,$(OS)))
+  HOST_SYS:= $(shell uname -s)
+else
+  HOST_SYS= Windows
+endif
+TARGET_SYS?= $(HOST_SYS)
+
+##############################################################################
+# Compiler flags
+##############################################################################
 
 CFLAGS=-O2 -g -std=c11 -fPIC
-LIBS := -lsqlite3
+
+##############################################################################
+# pcre2
+##############################################################################
 
 CFLAGS += $(shell pkg-config --cflags libpcre2-8)
-# CFLAGS += $(shell pkg-config --cflags libpcre) # TODO: delete me
-# LIBS += $(shell pkg-config --libs libpcre)
 LIBS += $(shell pkg-config --libs libpcre2-8)
 
-# WARN: not sure this is working
-#
-# ifeq ($(HOST_SYS),Darwin)
-# ifneq ($(wildcard /opt/homebrew/opt/sqlite/lib/pkgconfig/.*),)
-# export PKG_CONFIG_PATH := /opt/homebrew/opt/sqlite/lib/pkgconfig
-# endif
-# ifneq ($(wildcard /usr/local/opt/sqlite/lib/pkgconfig/.*),)
-# export PKG_CONFIG_PATH := /usr/local/opt/sqlite/lib/pkgconfig
-# endif
-# CFLAGS += $(shell pkg-config --cflags sqlite3)
-# LIBS += $(shell pkg-config --libs-only-L sqlite3)
-# endif # Darwin
+##############################################################################
+# sqlite3
+##############################################################################
 
-CFLAGS += -I/opt/homebrew/Cellar/sqlite/3.39.4/include
-LIBS += -L/opt/homebrew/Cellar/sqlite/3.39.4/lib
+LIBS += -lsqlite3
+ifeq ($(TARGET_SYS),Darwin)
+	# Try to use the Homebrew installed sqlite3
+	ifneq ("$(wildcard /opt/homebrew/opt/sqlite3/lib)","")
+		CFLAGS += -I/opt/homebrew/opt/sqlite3/lib/include
+		LIBS += -L/opt/homebrew/opt/sqlite3/lib
+	else
+	ifneq ("$(wildcard /usr/local/opt/sqlite3/lib)","")
+		CFLAGS += -I/usr/local/opt/sqlite3/lib/include
+		LIBS += -L/usr/local/opt/sqlite3/lib
+	else
+	endif
+	endif
+endif
 
-#
-# WARNINGS: https://gcc.gnu.org/onlinedocs/gcc/Warning-Options.html
-#
+##############################################################################
+# Warning options.
+##############################################################################
+
 CFLAGS += -Wall -Wextra -Wpedantic -pedantic-errors -Wshadow
 CFLAGS += -Wswitch-enum -Wcast-qual -Wpointer-arith
 CFLAGS += -Wstrict-overflow=5 -Wcast-align
@@ -38,46 +77,42 @@ CFLAGS += -Wno-gnu-zero-variadic-macro-arguments
 CFLAGS += -Wunused-macros
 CFLAGS += -Wnull-dereference
 
-# WARN WARN WARN WARN
-# Memory sanitizer:
-#
-# CFLAGS+=-fsanitize=address
+##############################################################################
+# System specific options.
+##############################################################################
 
-# LDFLAGS=-L/opt/homebrew/opt/sqlite/lib
-# LIBS += $(shell pkg-config --libs libpcre2-8)
-# LIBS += $(shell pkg-config --libs libpcre)
-# WARN
+ifeq ($(TARGET_SYS),Linux)
+	INSTALL_DEP = pcre2.so
+	CC_FLAGS = -shared
+	LIBS += -Wl,-z,defs
+else
+ifeq ($(TARGET_SYS),Darwin)
+	INSTALL_DEP = pcre2.dylib
+	CC_FLAGS = -dynamiclib
+endif
+endif
 
-# @echo "WAT"
-# @echo "WAT"
+##############################################################################
+# Make targets.
+##############################################################################
 
-# UNAME_S := $(shell uname -s)
-# ifeq ($(UNAME_S),Linux)
-# 	CFLAGS+=-D_GNU_SOURCE
-# endif
-# GO_INSTALL := GOBIN='$(abspath bin)' GOFLAGS= $(GO) install
+.PHONY: build clean dist install
 
-.PHONY : install dist clean
+$(INSTALL_DEP): pcre2.c
+	${CC} ${CC_FLAGS} -o $@ ${CFLAGS} pcre2.c ${LIBS}
 
-# Linux
-pcre.so : pcre.c
-	${CC} -shared -o $@ ${CFLAGS} -W -Werror pcre.c ${LIBS} -Wl,-z,defs
+build: $(INSTALL_DEP)
 
-# Darwin
-pcre.dylib : pcre.c
-	${CC} -dynamiclib -o $@ ${CFLAGS} pcre.c ${LIBS}
+clean:
+	@$(RM) *.so *.dylib *.plist sqlite3-pcre2-*.tar.gz
+	@$(RMDIR) *.dylib.dSYM sqlite3-pcre2-*
 
-# Darwin
-pcre2.dylib: pcre2.c
-	${CC} -dynamiclib -o $@ ${CFLAGS} pcre2.c ${LIBS}
+install: CFLAGS+=-DNDEBUG
+install: $(INSTALL_DEP)
+	${INSTALL} -pD -m755 ${INSTALL_DEP} ${DESTDIR}${PREFIX}/lib/sqlite3/${INSTALL_DEP}
 
-install : pcre.dylib
-	${INSTALL} -pD -m755 pcre.so ${DESTDIR}${prefix}/lib/sqlite3/pcre.so
+dist: clean
+	$(MKDIR) sqlite3-pcre2-${VERSION}
+	cp pcre2.c Makefile readme.txt sqlite3-pcre2-${VERSION}
+	tar -czf sqlite3-pcre2-${VERSION}.tar.gz sqlite3-pcre2-${VERSION}
 
-dist : clean
-	mkdir sqlite3-pcre-${VERSION}
-	cp -f pcre.c Makefile readme.txt sqlite3-pcre-${VERSION}
-	tar -czf sqlite3-pcre-${VERSION}.tar.gz sqlite3-pcre-${VERSION}
-
-clean :
-	-rm -rf *.so *.dylib *.dylib.dSYM
