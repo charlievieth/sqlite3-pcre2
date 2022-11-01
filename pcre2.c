@@ -1,6 +1,5 @@
 // vim: ts=4 sw=4
 
-#include <sqlite3.h>
 #include <sqlite3ext.h>
 SQLITE_EXTENSION_INIT1
 
@@ -8,12 +7,13 @@ SQLITE_EXTENSION_INIT1
 #include <pcre2.h>
 
 // TODO: make sure we need all of these
+#include <assert.h>
+#include <ctype.h>
+#include <stdarg.h>
+#include <stdbool.h>
+#include <stdint.h>
 #include <stdlib.h>
 #include <string.h>
-#include <stdarg.h>
-#include <ctype.h>
-#include <stdbool.h>
-#include <assert.h>
 
 #include "hedley.h"
 
