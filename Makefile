@@ -107,8 +107,11 @@ clean:
 	@$(RM) *.so *.dylib *.plist sqlite3-pcre2-*.tar.gz
 	@$(RMDIR) *.dylib.dSYM sqlite3-pcre2-*
 
+address: CFLAGS+=-fsanitize=address
+address: clean build
+
 install: CFLAGS+=-DNDEBUG
-install: $(INSTALL_DEP)
+install: build
 	${INSTALL} -pD -m755 ${INSTALL_DEP} ${DESTDIR}${PREFIX}/lib/sqlite3/${INSTALL_DEP}
 
 dist: clean
