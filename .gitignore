@@ -7,3 +7,4 @@
 .clang-format
 compile_commands.json
 tags
+vendor
