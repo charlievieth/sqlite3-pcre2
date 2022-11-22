@@ -30,10 +30,11 @@ SQLITE_EXTENSION_INIT1
 static_assert(1 <= CACHE_SIZE && CACHE_SIZE <= 1024, "invalid CACHE_SIZE");
 
 #ifndef JIT_STACK_START_SIZE
-#define JIT_STACK_START_SIZE (32 * 1024)
+#define JIT_STACK_START_SIZE (32 * 1024LU)
 #endif
+
 #ifndef JIT_STACK_MAX_SIZE
-#define JIT_STACK_MAX_SIZE (32 * 1024)
+#define JIT_STACK_MAX_SIZE (512 * 1024LU)
 #endif
 
 #define noinline HEDLEY_NEVER_INLINE
