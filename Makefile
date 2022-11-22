@@ -119,3 +119,8 @@ dist: clean
 	cp pcre2.c Makefile readme.txt sqlite3-pcre2-${VERSION}
 	tar -czf sqlite3-pcre2-${VERSION}.tar.gz sqlite3-pcre2-${VERSION}
 
+# WARN: fix build tags for Darwin
+.PHONY: test
+test: build
+	SQLITE3_PCRE2_LIBRARY=./pcre2.dylib go test -tags "libsqlite3 darwin"
+
