@@ -26,6 +26,11 @@ SQLITE_EXTENSION_INIT1
 #define CACHE_SIZE 16
 #endif
 
+// Invalid patterns larger than this size will be truncated.
+#ifndef MAX_DISPLAYED_PATTERN_LENGTH
+#define MAX_DISPLAYED_PATTERN_LENGTH 1024
+#endif
+
 // Require CACHE_SIZE to be reasonable (large values will make it slow
 // unless changed to use a hash map).
 static_assert(1 <= CACHE_SIZE && CACHE_SIZE <= 1024, "invalid CACHE_SIZE");
@@ -53,6 +58,12 @@ static_assert(1 <= CACHE_SIZE && CACHE_SIZE <= 1024, "invalid CACHE_SIZE");
 #else
 #define API
 #endif
+
+// GCC (-fanalyzer) only:
+//
+// void sqlite3_free(void*);
+// __attribute__ ((malloc, malloc(sqlite3_free, 1)))
+// void *sqlite3_malloc64(sqlite3_uint64);
 
 // malloc wrapper for pcre2
 HEDLEY_MALLOC
@@ -90,7 +101,7 @@ static void cache_entry_free(cache_entry *c) {
 		pcre2_code_free(c->code);
 	}
 	c->pattern = NULL;
-	c->caseless = 0;
+	c->caseless = false;
 	c->pattern_len = 0;
 	c->code = NULL;
 }
@@ -110,6 +121,8 @@ struct cache_list {
 	pcre2_general_context *general_context;
 	pcre2_compile_context *compile_context;
 	pcre2_jit_stack       *jit_stack;
+	// TODO: grow jit stack as needed
+	// ssize_t               jit_stack_size;
 	pcre2_match_context   *context;
 	pcre2_match_data      *match_data; // oveccount == 1
 
@@ -142,9 +155,6 @@ static inline void cache_list_move_front(cache_list *l, cache_entry *e) {
 }
 
 static inline void cache_list_move_back(cache_list *l, cache_entry *e) {
-	if (l->root.prev == e) {
-		return;
-	}
 	cache_list_move(e, l->root.prev);
 }
 
@@ -287,22 +297,22 @@ static cache_entry *cache_list_next(cache_list *l) {
     return e;
 }
 
-static inline bool non_ascii(int ch) {
-	return !isascii(ch) || ch == '\033';
-}
+// static inline bool non_ascii(int ch) {
+// 	return !isascii(ch) || ch == '\033';
+// }
 
-static bool has_non_ascii(const char *s) {
-	if (!s) {
-		return false;
-	}
-	int ch;
-	while ((ch = *s++) != '\0') {
-		if (non_ascii(ch)) {
-			return true;
-		}
-	}
-	return false;
-}
+// static bool has_non_ascii(const char *s) {
+// 	if (!s) {
+// 		return false;
+// 	}
+// 	int ch;
+// 	while ((ch = *s++) != '\0') {
+// 		if (non_ascii(ch)) {
+// 			return true;
+// 		}
+// 	}
+// 	return false;
+// }
 
 // // static bool has_non_ascii_2(const char *s, ssize_t n) {
 // static bool has_non_ascii_2(const char *s, int n) {
@@ -363,37 +373,54 @@ static noinline void handle_pcre2_error(sqlite3_context *ctx, int errcode,
 }
 
 // WARN: is bool the correct return type ???
-// static bool fixup_pattern(sqlite3_context *ctx, const char *str, size_t str_len,
-//                           char **dst, size_t *dst_len) {
-//
-// 	// TODO: use a macro and make this configurable
-// 	const size_t max_size = 1024;
-//
-// 	if (str_len <= max_size) {
-// 		*dst = NULL;
-// 		*dst_len = 0;
-// 		return false;
-// 	}
-//
-// 	// const char *format = "%.*s\n... omitting %d bytes ...\n%.*s";
-// 	const char *format = "%.*s... [omitting %d bytes] ...%.*s";
-//
-// 	int omitted = str_len - max_size;
-// 	int n = snprintf(NULL, 0, format, max_size/2, str, omitted, max_size/2,
-// 	                 &str[str_len - (max_size/2)]);
-// 	assert(n >= 0);
-//
-// 	char *buf = malloc(n + 1);
-// 	n = snprintf(buf, n + 1, format, max_size/2, str, omitted, max_size/2,
-// 	             &str[str_len - (max_size/2)]);
-// 	assert(n >= 0);
-//
-// 	*dst = buf;
-// 	*dst_len = n;
-//
-// 	return true;
-// }
+static bool truncate_pattern(sqlite3_context *ctx, const char *str, size_t str_len,
+                             char **dst, size_t *dst_len) {
 
+	#define max_size MAX_DISPLAYED_PATTERN_LENGTH
+
+	if (str_len <= max_size) {
+		*dst = NULL;
+		*dst_len = 0;
+		return false;
+	}
+
+	const char *format = "%.*s... omitting %d bytes ...%.*s";
+
+	// TODO: use sqlite3's printf with "%n" to get the size
+	int omitted = str_len - max_size;
+	int n = snprintf(NULL, 0, format, max_size/2, str, omitted, max_size/2,
+	                 &str[str_len - (max_size/2)]);
+	assert(n >= 0);
+
+	char *buf = malloc(n + 1);
+	n = snprintf(buf, n + 1, format, max_size/2, str, omitted, max_size/2,
+	             &str[str_len - (max_size/2)]);
+	assert(n >= 0);
+
+	*dst = buf;
+	*dst_len = n;
+
+	return true;
+	#undef max_size
+}
+
+static noinline void handle_pcre2_compilation_error(
+	sqlite3_context *ctx,
+	int errcode,
+    const char *pattern,
+    uint32_t pattern_len,
+    size_t errpos
+) {
+	char *buf = NULL;
+	if (pattern_len > MAX_DISPLAYED_PATTERN_LENGTH) {
+		size_t blen = 0;
+		truncate_pattern(ctx, pattern, pattern_len, &buf, &blen);
+	}
+	handle_pcre2_error(ctx, errcode, "error compiling pattern '%s' at offset %llu",
+	                   pattern, (uint64_t)errpos);
+}
+
+// WARN: remove this
 // __thread pcre2_jit_stack *xjit_stack = NULL;
 __thread cache_list *_cache = NULL;
 
@@ -446,6 +473,8 @@ static cache_entry *regexp_compile(sqlite3_context *ctx, cache_list *cache,
 		}
 	}
 
+	// WARN: this currently leaks since nothing cleans
+	// up the per-thread cache.
 	ent->pattern = sqlite3_malloc64(pattern_len + 1);
 	if (unlikely(ent->pattern == NULL)) {
 		goto err_nomem;
@@ -467,9 +496,30 @@ err_nomem:
 	return NULL;
 }
 
+// /* Return true if E is an error code for bad UTF-8, and if pcre2_match
+//    could return E because PCRE lacks PCRE2_MATCH_INVALID_UTF.  */
+// static bool bad_utf8_from_pcre2(int e) {
+// #ifdef PCRE2_MATCH_INVALID_UTF
+// 	return false;
+// #else
+// 	return PCRE2_ERROR_UTF8_ERR21 <= e && e <= PCRE2_ERROR_UTF8_ERR1;
+// #endif
+// }
+
+// WARN: rename
+// static int jit_exec(cache_list *cache, cache_entry *ent, const char *subject, size_t subject_len) {
+// 	while (true) {
+// 		int e = pcre2_match(ent->code, (const PCRE2_SPTR)subject, subject_len,
+// 	                        0, 0, cache->match_data, cache->context);
+// 		if (e == PCRE2_ERROR_JIT_STACKLIMIT) {
+// 			/* code */
+// 		}
+// 	};
+// 	return 0;
+// }
+
 static inline void regexp_func(sqlite3_context *ctx, int argc, sqlite3_value **argv, bool caseless) {
-	#define ERR(msg)  "regexp: "msg
-	// #define IERR(msg) "regexp: internal error: "msg
+	#define ERR(msg) "regexp: "msg
 
 	if (unlikely(argc != 2)) {
 		sqlite3_result_error(ctx, ERR("invalid number of arguments"), -1);
@@ -496,9 +546,13 @@ static inline void regexp_func(sqlite3_context *ctx, int argc, sqlite3_value **a
 		return;
 	}
 	if (unlikely(pattern_len) > UINT32_MAX) {
-		sqlite3_result_error(ctx, ERR("pattern exceeds UINT32_MAX"), -1);
+		sqlite3_result_error(ctx, ERR("pattern size exceeds UINT32_MAX"), -1);
 	}
 
+	// TODO: do was grep does and check if the pattern matches
+	// an empty string when compiling.
+	//
+	// TODO: handle zero length subjects?
 	int subject_len = sqlite3_value_bytes(argv[1]);
 
 	const char *pattern = (const char *)sqlite3_value_text(argv[0]);
@@ -508,8 +562,10 @@ static inline void regexp_func(sqlite3_context *ctx, int argc, sqlite3_value **a
 		return;
 	}
 
+	// WARN: remove this
 	if (_cache == NULL) {
-		if (unlikely((_cache = cache_list_init()) == NULL)) {
+		_cache = cache_list_init();
+		if (unlikely(_cache == NULL)) {
 			sqlite3_result_error_nomem(ctx);
 			return;
 		}
@@ -556,7 +612,9 @@ static void sqlite3_pcre_destroy(void *p) {
 // TODO: add case insensitive "IREGEXP"
 //
 // NOTE: name must be "pcre"
-API int sqlite3_pcre_init(sqlite3 *db, char **pzErrMsg, const sqlite3_api_routines *pApi) {
+//
+// API int sqlite3_pcre_init(sqlite3 *db, char **pzErrMsg, const sqlite3_api_routines *pApi) {
+API int sqlite3_sqlitepcre_init(sqlite3 *db, char **pzErrMsg, const sqlite3_api_routines *pApi) {
 	(void)pzErrMsg;
 
 	int rc = SQLITE_OK;

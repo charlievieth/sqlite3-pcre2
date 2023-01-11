@@ -1,6 +1,7 @@
 /*.sqlite3
 /.cache
 /tmp
+/sqlite3-pcre2.test
 *.dylib
 *.dylib.dSYM
 *.plist
