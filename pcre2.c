@@ -24,6 +24,7 @@ SQLITE_EXTENSION_INIT1
 
 #include "hedley.h"
 
+// Size of the compiled pcre2 code cache.
 #ifndef CACHE_SIZE
 #define CACHE_SIZE 16
 #endif
@@ -37,10 +38,13 @@ SQLITE_EXTENSION_INIT1
 // unless changed to use a hash map).
 HEDLEY_STATIC_ASSERT(1 <= CACHE_SIZE && CACHE_SIZE <= 1024, "invalid CACHE_SIZE");
 
+// Start size of the pcre2 JIT stack.
 #ifndef JIT_STACK_START_SIZE
-#define JIT_STACK_START_SIZE (32 * 1024LU)
+#define JIT_STACK_START_SIZE (0)
+// #define JIT_STACK_START_SIZE (32 * 1024LU)
 #endif
 
+// Maximum size of the pcre2 JIT stack.
 #ifndef JIT_STACK_MAX_SIZE
 #define JIT_STACK_MAX_SIZE (512 * 1024LU)
 #endif
@@ -237,6 +241,7 @@ static int cache_list_init_jit_stack(cache_list *cache) {
 	return 0;
 }
 
+// TODO: rename "list" to "cache" and make this consistent across functions.
 static void cache_list_free(cache_list *list) {
 	if (!list) {
 		return;
@@ -268,9 +273,10 @@ static void cache_list_free(cache_list *list) {
 	sqlite3_free(list);
 }
 
-static void sqlite3_pcre_destroy(void *p) {
+// TODO: rename
+static void sqlite3_cache_list_destroy(void *p) {
 	cache_list *list = (cache_list *)p;
-	if (list && --list->ref_count <= 0) {
+	if (--list->ref_count <= 0) {
 		cache_list_free(list);
 	}
 }
@@ -551,26 +557,30 @@ err_nomem:
 // #endif
 // }
 
-// WARN: rename
+// // WARN: rename
 // static int jit_exec(cache_list *cache, cache_entry *ent, const char *subject, size_t subject_len) {
 // 	while (true) {
-// 		int e = pcre2_match(ent->code, (const PCRE2_SPTR)subject, subject_len,
+// 		int rc = pcre2_match(ent->code, (const PCRE2_SPTR)subject, subject_len,
 // 	                        0, 0, cache->match_data, cache->context);
-// 		if (e == PCRE2_ERROR_JIT_STACKLIMIT) {
-// 			/* code */
+// 		if (rc == PCRE2_ERROR_JIT_STACKLIMIT && cache->jit_stack == NULL) {
+// 			cache_list_init_jit_stack(cache);
+// 		} else {
+// 			return rc;
 // 		}
 // 	};
 // 	return 0;
 // }
 
+static inline int regexp_match(cache_list *cache, cache_entry *ent,
+	                           const char *subject, size_t subject_len) {
+	return pcre2_match(ent->code, (const PCRE2_SPTR)subject, subject_len,
+	                   0, 0, cache->match_data, cache->context);
+}
+
 static inline void regexp_func(sqlite3_context *ctx, int argc, sqlite3_value **argv, bool caseless) {
 	#define ERR(msg) "regexp: "msg
 
-	// TODO: probably don't need this
-	if (unlikely(argc != 2)) {
-		sqlite3_result_error(ctx, ERR("invalid number of arguments"), -1);
-		return;
-	}
+	assert(argc == 2);
 
 	// TODO: only allow string patterns
 	// TODO: this is unlikely
@@ -609,14 +619,6 @@ static inline void regexp_func(sqlite3_context *ctx, int argc, sqlite3_value **a
 		return;
 	}
 
-	// // WARN: remove this
-	// if (_cache == NULL) {
-	// 	_cache = cache_list_init();
-	// 	if (unlikely(_cache == NULL)) {
-	// 		sqlite3_result_error_nomem(ctx);
-	// 		return;
-	// 	}
-	// }
 	cache_list *cache = sqlite3_user_data(ctx);
 	assert(cache);
 
@@ -629,8 +631,7 @@ static inline void regexp_func(sqlite3_context *ctx, int argc, sqlite3_value **a
 		}
 	}
 
-	int rc = pcre2_match(ent->code, (const PCRE2_SPTR)subject, subject_len,
-	                     0, 0, cache->match_data, cache->context);
+	int rc = regexp_match(cache, ent, subject, subject_len);
 	if (likely(rc >= PCRE2_ERROR_NOMATCH)) {
 		sqlite3_result_int(ctx, !!(rc >= 0));
 	} else {
@@ -655,28 +656,34 @@ API int sqlite3_sqlitepcre_init(sqlite3 *db, char **pzErrMsg, const sqlite3_api_
 	int rc = SQLITE_OK;
 	SQLITE_EXTENSION_INIT2(pApi);
 
+	// TODO: try to use two caches
+
+	// TODO: lazily initialize backing memory
 	cache_list *cache = cache_list_init();
 	if (!cache) {
-		return SQLITE_NOMEM;
+		rc = SQLITE_NOMEM;
+		goto exit;
 	}
 	assert(cache);
 
-	// WARN WARN WARN WARN
-	// int *data = sqlite3_malloc64(sizeof(int));
-
 	// TODO: add desctructor function
 	const int opts = SQLITE_UTF8 | SQLITE_INNOCUOUS | SQLITE_DETERMINISTIC;
-	// rc = sqlite3_create_function_v2(db, "regexp", 2, opts, cache, regexp, NULL,
-	//                                 NULL, sqlite3_pcre_destroy);
 
-	// WARN: don't count refs without more testing!!!
 	cache->ref_count++;
-	rc = sqlite3_create_function_v2(db, "regexp", 2, opts, cache, regexp, NULL,
-	                                NULL, sqlite3_pcre_destroy);
-	if (rc == SQLITE_OK) {
-		cache->ref_count++;
-		rc = sqlite3_create_function_v2(db, "iregexp", 2, opts, cache, iregexp, NULL,
-		                                NULL, sqlite3_pcre_destroy);
+	rc = sqlite3_create_function_v2(db, "regexp", 2, opts, (void*)cache, regexp,
+	                                NULL, NULL, sqlite3_cache_list_destroy);
+	if (rc != SQLITE_OK) {
+		goto exit;
+	}
+	cache->ref_count++;
+	rc = sqlite3_create_function_v2(db, "iregexp", 2, opts, (void*)cache, iregexp,
+	                                NULL, NULL, sqlite3_cache_list_destroy);
+exit:
+	if (rc != SQLITE_OK) {
+		if (cache) {
+			cache->ref_count = 0;
+			cache_list_free(cache);
+		}
 	}
 	return rc;
 }
