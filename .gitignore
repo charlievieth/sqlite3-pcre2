@@ -5,6 +5,7 @@
 *.dylib
 *.dylib.dSYM
 *.plist
+*.dSYM
 .clang-format
 compile_commands.json
 tags
