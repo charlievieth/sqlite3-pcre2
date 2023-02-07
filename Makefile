@@ -8,15 +8,17 @@ VERSION= $(MAJVER).$(MINVER).$(RELVER)$(PREREL)
 
 ##############################################################################
 #
-# Change the installation path as needed. This automatically adjusts
-# the paths in src/luaconf.h, too. Note: PREFIX must be an absolute path!
+# Change the installation path as needed.
+# Note: PREFIX must be an absolute path!
 #
 export PREFIX= /usr/local
-export MULTILIB= lib
 ##############################################################################
 
-DEFAULT_CC = gcc
-CC= $(DEFAULT_CC)
+DEFAULT_CC = cc
+DEFAULT_CXX = g++
+CC = $(DEFAULT_CC)
+CXX = $(DEFAULT_CXX)
+GOTAGS =
 
 RM= rm -f
 MKDIR= mkdir -p
@@ -28,17 +30,18 @@ UNINSTALL= $(RM)
 INSTALL=install
 
 ifeq (,$(findstring Windows,$(OS)))
-  HOST_SYS:= $(shell uname -s)
+	HOST_SYS:= $(shell uname -s)
 else
-  HOST_SYS= Windows
+	HOST_SYS= Windows
 endif
-TARGET_SYS?= $(HOST_SYS)
+TARGET_SYS ?= $(HOST_SYS)
 
 ##############################################################################
 # Compiler flags
 ##############################################################################
 
-CFLAGS=-O2 -g -std=c11 -fPIC
+CFLAGS = -O2 -g -std=c11
+# CPPFLAGS = -O2 -g -std=c++20
 
 ##############################################################################
 # pcre2
@@ -52,18 +55,19 @@ LIBS += $(shell pkg-config --libs libpcre2-8)
 ##############################################################################
 
 LIBS += -lsqlite3
+
+# TODO: make using the Homebrew installed sqlite3 optional
 ifeq ($(TARGET_SYS),Darwin)
-	# Try to use the Homebrew installed sqlite3
-	ifneq ("$(wildcard /opt/homebrew/opt/sqlite3/lib)","")
-		CFLAGS += -I/opt/homebrew/opt/sqlite3/lib/include
-		LIBS += -L/opt/homebrew/opt/sqlite3/lib
-	else
-	ifneq ("$(wildcard /usr/local/opt/sqlite3/lib)","")
-		CFLAGS += -I/usr/local/opt/sqlite3/lib/include
-		LIBS += -L/usr/local/opt/sqlite3/lib
-	else
+	ifneq ("$(wildcard /opt/homebrew/opt/sqlite/lib/pkgconfig)","")
+		PKG_CONFIG_PATH = /opt/homebrew/opt/sqlite/lib/pkgconfig
 	endif
+	ifneq ("$(wildcard /usr/local/opt/sqlite/lib/pkgconfig)","")
+		PKG_CONFIG_PATH = /usr/local/opt/sqlite/lib/pkgconfig
 	endif
+	export PKG_CONFIG_PATH
+	CFLAGS += $(shell pkg-config --cflags sqlite3)
+	LIBS += $(shell pkg-config --libs-only-L sqlite3)
+	GOTAGS += -tags "libsqlite3,darwin"
 endif
 
 ##############################################################################
@@ -73,22 +77,35 @@ endif
 CFLAGS += -Wall -Wextra -Wpedantic -pedantic-errors -Wshadow
 CFLAGS += -Wswitch-enum -Wcast-qual -Wpointer-arith
 CFLAGS += -Wstrict-overflow=5 -Wcast-align
-CFLAGS += -Wno-gnu-zero-variadic-macro-arguments
+# TODO: this is clang specific
+# CFLAGS += -Wno-gnu-zero-variadic-macro-arguments
 CFLAGS += -Wunused-macros
 CFLAGS += -Wnull-dereference
+CFLAGS += -Wconversion
+CFLAGS += -Wno-sign-conversion
+# CEV: disable if this gets too noisy
+CFLAGS += -Wwrite-strings
+CFLAGS += -Winline
+
+# WARN: debug (and gcc) only
+# CFLAGS += -Wno-aggressive-loop-optimizations
+# CFLAGS += -Wvector-operation-performance
+# CFLAGS += -Wdisabled-optimization
+# CFLAGS += -fanalyzer
 
 ##############################################################################
 # System specific options.
 ##############################################################################
 
+TEST_DEP = pcre2_test
 ifeq ($(TARGET_SYS),Linux)
-	INSTALL_DEP = pcre2.so
-	CC_FLAGS = -shared
+	INSTALL_DEP = sqlite3_pcre2.so
+	CC_FLAGS = -shared -fPIC
 	LIBS += -Wl,-z,defs
 else
 ifeq ($(TARGET_SYS),Darwin)
-	INSTALL_DEP = pcre2.dylib
-	CC_FLAGS = -dynamiclib
+	INSTALL_DEP = sqlite3_pcre2.dylib
+	CC_FLAGS = -dynamiclib -fPIC
 endif
 endif
 
@@ -99,14 +116,20 @@ endif
 .PHONY: build clean dist install
 
 $(INSTALL_DEP): pcre2.c
-	${CC} ${CC_FLAGS} -o $@ ${CFLAGS} pcre2.c ${LIBS}
+	@${CC} ${CC_FLAGS} -o $@ ${CFLAGS} pcre2.c ${LIBS}
 
-build: $(INSTALL_DEP)
+# WARN: split C/C++ flags
+$(TEST_DEP): pcre2_test.cc
+	${CXX} -o $@ ${CFLAGS} -std=c++20 ${LIBS} pcre2_test.cc
+
+build: $(INSTALL_DEP) $(TEST_DEP)
 
 clean:
-	@$(RM) *.so *.dylib *.plist sqlite3-pcre2-*.tar.gz
-	@$(RMDIR) *.dylib.dSYM sqlite3-pcre2-*
+	@$(RM) *.so *.dylib *.plist sqlite3-pcre2-*.tar.gz $(TEST_DEP)
+	@$(RMDIR) *.dylib.dSYM *.dSYM sqlite3-pcre2-*
+	@go clean
 
+.PHONY: address
 address: CFLAGS+=-fsanitize=address
 address: clean build
 
@@ -121,6 +144,50 @@ dist: clean
 
 # WARN: fix build tags for Darwin
 .PHONY: test
+test: CFLAGS+=-DMAX_DISPLAYED_PATTERN_LENGTH=256
 test: build
-	SQLITE3_PCRE2_LIBRARY=./pcre2.dylib go test -tags "libsqlite3 darwin"
+	@SQLITE3_PCRE2_LIBRARY=$(INSTALL_DEP) go test $(GOTAGS)
 
+# TODO: reuse make targets
+.PHONY: testrace
+testrace: CFLAGS+=-DMAX_DISPLAYED_PATTERN_LENGTH=256
+testrace: build
+	@SQLITE3_PCRE2_LIBRARY=$(INSTALL_DEP) go test $(GOTAGS)
+
+# TODO: reuse make targets
+.PHONY: shorttest
+shorttest: CFLAGS+=-DMAX_DISPLAYED_PATTERN_LENGTH=256
+shorttest: build
+	@SQLITE3_PCRE2_LIBRARY=$(INSTALL_DEP) go test $(GOTAGS)
+
+# TODO: rename
+.PHONY: test_pcre2
+test_pcre2: build
+	@echo ""
+	@./$(TEST_DEP)
+
+# TODO: build and run in separate steps
+# pcre2_test: CFLAGS+=-fsanitize=address
+# pcre2_test: address
+# pcre2_test: build
+# 	${CC} -o $@ ${CFLAGS} pcre2_test.c ${LIBS}
+# 	@./pcre2_test
+
+# WARN: make is this correct
+compile_commands.json: pcre2.c
+compile_commands.json: $(INSTALL_DEP)
+	bear -- $(MAKE) build
+
+.PHONY: lint_pcre2
+lint_pcre2: compile_commands.json
+	clang-tidy ./pcre2.c
+
+.PHONY: lint_pcre2_test
+lint_pcre2_test: compile_commands.json
+	clang-tidy ./pcre2_test.cc
+
+.PHONY: lint
+lint: lint_pcre2 lint_pcre2_test
+
+.PHONY: all
+all: build
