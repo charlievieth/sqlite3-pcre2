@@ -9,6 +9,7 @@ import (
 	"errors"
 	"os"
 	"path/filepath"
+	"runtime"
 	"strings"
 	"sync"
 
@@ -21,7 +22,7 @@ const (
 	//
 	// 	sql.Open(pcre2.DriverName, "opts...").
 	//
-	DriverName = "sqlite3_with_pcre2"
+	DriverName = "sqlite3_pcre2"
 
 	// Name of the sqlite3_pcre2 library without file extension(s).
 	LibraryName = "sqlite3_pcre2"
@@ -29,6 +30,8 @@ const (
 	// Environment variable key to set a custom path to the sqlite3_pcre2
 	// library, which can be the path to the library itself or the directory
 	// containing it.
+	//
+	// The path must be absolute.
 	EnvKey = "SQLITE3_PCRE2_LIBRARY"
 )
 
@@ -36,77 +39,107 @@ const (
 // found.
 var ErrLibraryNotFound = errors.New("pcre2: could not find sqlite3_pcre2 shared library")
 
-var executable = func() string {
-	s, _ := os.Executable()
-	return filepath.Dir(s)
-}()
-
-// BaseSearchPaths are the first file system paths searched for the
-// sqlite3_pcre2 shared library and are prepended to DefaultSearchPaths.
-// Relative paths are joined with the current working directory.
-// Empty strings are ignored.
-//
-// The search order is:
-//  1. "SQLITE3_PCRE2_LIBRARY" environment variable, which can be the path to
-//     the shared library or the directory containing it.
-//  2. Directory containing the executable that started the current process.
-//     If the executable is a symlink the directory containing the symlink is
-//     also searched.
-//  3. Current working directory (WARN: this can be exploited).
-//  4. System specific directories ("/usr/local/lib").
-//
-// System specific search paths are added via the DefaultSearchPaths variable.
-// The DefaultSearchPaths variable should be modified to add custom search
-// paths.
-var BaseSearchPaths = []string{
-
-	// TODO: if "SQLITE3_PCRE2_LIBRARY" is set or the path is explicitly set
-	// then we should only consider those and error otherwise.
-
-	// The "SQLITE3_PCRE2_LIBRARY" environment variable which can be a
-	// directory or the path to the shared library.
-	os.Getenv(EnvKey),
-
-	// Directory containing the exectuable that started the process (the
-	// process may be symlinked into this directory).
-	executable,
-
-	// Directory containing the exectuable that started the process after
-	// resolving symlinks (or an empty string if there are no symlinks).
-	func() string {
-		s, _ := filepath.EvalSymlinks(executable)
-		return s
-	}(),
-
-	// Current working directory.
-	".",
-}
-
 var (
-	libraryPath string
-	loadErr     error
-	searchPaths []string
+	searchWD        bool   // search current working directory
+	libraryPath     string // user specified path to the sqlite3_pcre2 library
+	progDir         string // directory containing the running executable
+	progDirAbs      string // resolved path to progDir
+	loadprogExeOnce sync.Once
 )
 
-// WARN: should not load here
-// func LibraryPath() (string, error) {
-// 	LoadLibrary()
-// 	return libraryPath, loadErr
-// }
-
-// WARN: implement
-//
-// TODO: prevent from being called mutliple times?
-func SetLibraryPath(path string) {
-	libraryPath = path
+func requireAbsPath(path string) string {
+	path = filepath.Clean(path)
+	if !filepath.IsAbs(path) {
+		return ""
+	}
+	return path
 }
 
-// TODO: Note that paths can be directories or files.
-// TODO: Support expanding env vars?
+func loadProgExe() {
+	exe, _ := os.Executable()
+	if exe == "" {
+		return
+	}
+	progDir = requireAbsPath(filepath.Dir(exe))
+	if progDir != "" {
+		progDirAbs, _ = filepath.EvalSymlinks(progDir)
+		progDirAbs = requireAbsPath(progDirAbs)
+	}
+}
+
+// SearchWorkingDirectory toggles if the current working directory is searched
+// for the sqlite3_pcre2 shared library and returns the previous state.
 //
-// TODO: prevent from being called mutliple times?
-func SetSearchPaths(paths ...string) {
-	searchPaths = append(searchPaths[:0], paths...)
+// Searching the current working directory is disabled by default because it
+// can be exploited to load malicious code.
+func SearchWorkingDirectory(search bool) (previous bool) {
+	previous = searchWD
+	searchWD = search
+	return previous
+}
+
+// SearchPaths returns the system paths searched for the sqlite3_pcre2 shared
+// library.
+//
+// The search order is:
+//
+//  1. The path set by SetLibraryPath(), if any, which can be the path to the
+//     shared library or the directory containing it. If set, the seach ends
+//     here (that is the below locations will not be checked).
+//
+//  2. "SQLITE3_PCRE2_LIBRARY" environment variable, which can be the path to
+//     the shared library or the directory containing it.
+//
+//  3. Directory containing the executable that started the current process.
+//     If the executable is a symlink the directory containing the symlink is
+//     also searched.
+//
+//  4. System specific directories ("/usr/local/lib").
+//
+//  5. The current working directory, but only if SearchWorkingDirectory(true)
+//     is enabled.
+//
+// Relative paths are joined with the current working directory. Empty strings
+// are ignored.
+func SearchPaths() []string {
+	if libraryPath != "" {
+		return filepath.SplitList(libraryPath)
+	}
+	loadprogExeOnce.Do(loadProgExe)
+	paths := make([]string, 0, 8)
+	if env := os.Getenv(EnvKey); env != "" {
+		for _, p := range filepath.SplitList(env) {
+			if p = requireAbsPath(p); p != "" {
+				paths = append(paths, p)
+			}
+		}
+	}
+	paths = append(paths, progDir, progDirAbs)
+	if runtime.GOOS == "darwin" {
+		paths = append(paths, "/opt/homebrew/lib")
+	}
+	if runtime.GOOS != "windows" {
+		paths = append(paths, "/usr/local/lib", "/usr/lib", "/lib")
+	}
+	if searchWD {
+		paths = append(paths, ".")
+	}
+	a := paths[:0]
+	for _, s := range paths {
+		if s != "" {
+			a = append(a, s)
+		}
+	}
+	return a
+}
+
+// SetLibraryPath sets the path to the sqlite3_pcre2 shared library, which can
+// be the path to the shared library or the directory containing it. Relative
+// paths are allowed.
+//
+// If set, then *only* this path will be searched.
+func SetLibraryPath(path string) {
+	libraryPath = path
 }
 
 func isFile(path string) bool {
@@ -186,12 +219,13 @@ func cacheKey(paths, exts []string) string {
 	return w.String()
 }
 
+// TODO: only cache the library that was successfully loaded
 func findLibrariesCached(paths []string) ([]string, error) {
 	key := cacheKey(paths, LibExts)
 	if v, ok := libraryCache.Load(key); ok {
 		return v.([]string), nil
 	}
-	libs, err := findLibraries(DefaultSearchPaths)
+	libs, err := findLibraries(paths)
 	if err != nil {
 		return nil, err
 	}
@@ -199,21 +233,13 @@ func findLibrariesCached(paths []string) ([]string, error) {
 	return libs, nil
 }
 
-// TODO: use this to preemptively load the library and set the path to it so
-// that searches can be skipped in the ConnectHook.
-func LoadLibrary() (string, error) {
-	panic("IMPLEMENT")
-	// loadOnce.Do(func() {
-	// 	libraryPath, loadErr = findLibrary()
-	// })
-	// return libraryPath, loadErr
-}
-
-func sqlite3ConnectHook(conn *sqlite3.SQLiteConn) error {
-	libs, err := findLibrariesCached(DefaultSearchPaths)
+func Sqlite3ConnectHook(conn *sqlite3.SQLiteConn) error {
+	paths := SearchPaths()
+	libs, err := findLibrariesCached(paths)
 	if err != nil {
 		return ErrLibraryNotFound
 	}
+	// TODO: add lib paths to the returned error, if any.
 	for _, lib := range libs {
 		err := conn.LoadExtension(lib, "sqlite3_sqlitepcre_init")
 		if err == nil {
@@ -225,6 +251,6 @@ func sqlite3ConnectHook(conn *sqlite3.SQLiteConn) error {
 
 func init() {
 	sql.Register(DriverName, &sqlite3.SQLiteDriver{
-		ConnectHook: sqlite3ConnectHook,
+		ConnectHook: Sqlite3ConnectHook,
 	})
 }

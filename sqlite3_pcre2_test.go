@@ -6,20 +6,41 @@ import (
 	"bytes"
 	"compress/gzip"
 	"database/sql"
-	"database/sql/driver"
 	"errors"
 	"fmt"
 	"io"
 	"math"
 	"os"
+	"path/filepath"
 	"strings"
 	"sync"
 	"testing"
 	"text/tabwriter"
 	"time"
-
-	"github.com/mattn/go-sqlite3"
 )
+
+func TestMain(m *testing.M) {
+	// TODO: also test: SearchWorkingDirectory(search)
+
+	exe, err := os.Executable()
+	if err != nil {
+		panic(err)
+	}
+	dir := filepath.Dir(exe)
+	wd, err := os.Getwd()
+	if err != nil {
+		panic(err)
+	}
+	for _, ext := range LibExts {
+		name := LibraryName + ext
+		src := filepath.Join(wd, name)
+		if fileExists(src) {
+			dst := filepath.Join(dir, name)
+			os.Symlink(src, dst)
+		}
+	}
+	os.Exit(m.Run())
+}
 
 // var libraryPath string
 
@@ -81,17 +102,7 @@ func fileExists(name string) bool {
 // TODO: try to use the same DB connection so that we
 // can test the thread safety of the library.
 func InitDatabase(t testing.TB) (*sql.DB, func()) {
-	// WARN: remove if using memory database !!!
-	// WARN: _mutex=full
-	// &mode=memory
-	if fileExists("test.db") {
-		if err := os.Remove("test.db"); err != nil {
-			t.Fatal(err)
-		}
-	}
-
 	const filename = ":memory:"
-	// const filename = "test.db"
 	const opts = "?cache=shared&_mutex=no"
 	// db, err := sql.Open("sqlite3_with_regexp", "file:test.db?cache=shared")
 	db, err := sql.Open(DriverName, "file:"+filename+opts)
@@ -150,121 +161,6 @@ func InsertIntoStringsTable(t testing.TB, db *sql.DB, values ...any) {
 
 func InsertIntoBlobsTable(t testing.TB, db *sql.DB, values ...any) {
 	InsertIntoTable(t, db, "blobs_table", values...)
-}
-
-// Test in parallel using the same connection.
-//
-// TODO: clean this up
-func TestPCRE2_XXX(t *testing.T) {
-	// Open db conn
-
-	sqlDriver := &sqlite3.SQLiteDriver{
-		ConnectHook: sqlite3ConnectHook,
-	}
-	// WARN: full MUTEX
-	// v, err := sqlDriver.Open("file::memory:?cache=shared&_mutex=no")
-
-	v, err := sqlDriver.Open("file::memory:?cache=shared&_mutex=full")
-	if err != nil {
-		t.Fatal(err)
-	}
-	conn := v.(*sqlite3.SQLiteConn)
-
-	for _, name := range TableNames {
-		conn.Exec(fmt.Sprintf("DELETE FROM %s;", name), nil)
-	}
-
-	for _, stmt := range []string{
-		CreateStringsTableStmt,
-	} {
-		if _, err := conn.Exec(stmt, nil); err != nil {
-			t.Fatal(err)
-		}
-	}
-
-	// Insert values
-
-	insertStmt, err := conn.Prepare("INSERT INTO strings_table (value) VALUES (?);")
-	if err != nil {
-		t.Fatal(err)
-	}
-
-	for ch := 'A'; ch <= 'Z'; ch++ {
-		val := strings.Repeat(fmt.Sprintf("%c", ch), 4)
-		for i := 0; i < 4; i++ {
-			_, err := insertStmt.Exec([]driver.Value{val})
-			if err != nil {
-				t.Fatal(err)
-			}
-		}
-	}
-
-	if err := insertStmt.Close(); err != nil {
-		t.Fatal(err)
-	}
-
-	const queryFmt = "SELECT COUNT(*) FROM strings_table WHERE value REGEXP '.*%c.*';"
-
-	queryRow := func(conn *sqlite3.SQLiteConn, query string) (int64, error) {
-		rows, err := conn.Query(query, nil)
-		if err != nil {
-			return 0, err
-		}
-		dest := []driver.Value{int64(0)}
-		if err := rows.Next(dest); err != nil {
-			return 0, err
-		}
-		if err := rows.Next(nil); err != io.EOF {
-			return 0, err
-		}
-		if err := rows.Close(); err != nil {
-			return 0, err
-		}
-		return dest[0].(int64), nil
-	}
-
-	t.Run("Serial", func(t *testing.T) {
-		for ch := 'A'; ch <= 'Z'; ch++ {
-			query := fmt.Sprintf(queryFmt, ch)
-			n, err := queryRow(conn, query)
-			if err != nil {
-				t.Fatal(err)
-			}
-			if n != 4 {
-				t.Fatalf("%c: got: %d; want: %d", ch, n, 4)
-			}
-		}
-	})
-
-	t.Run("Parallel", func(t *testing.T) {
-		iterations := 500
-		if testing.Short() {
-			iterations = 100
-		}
-		var wg sync.WaitGroup
-		start := make(chan struct{})
-		for ch := 'A'; ch <= 'Z'; ch++ {
-			wg.Add(1)
-			go func(ch rune) {
-				defer wg.Done()
-				query := fmt.Sprintf(queryFmt, ch)
-				<-start // start all the queries at once
-				for i := 0; i < iterations; i++ {
-					n, err := queryRow(conn, query)
-					if err != nil {
-						t.Error(err)
-						return
-					}
-					if n != 4 {
-						t.Errorf("%c: got: %d; want: %d", ch, n, 4)
-						return
-					}
-				}
-			}(ch)
-		}
-		close(start)
-		wg.Wait()
-	})
 }
 
 func TestPCRE2(t *testing.T) {
@@ -853,10 +749,10 @@ func TestMatchFailure(t *testing.T) {
 }
 
 func TestLibraryNotFound(t *testing.T) {
-	origPaths := append([]string(nil), DefaultSearchPaths...)
-	DefaultSearchPaths = []string{"/tmp"}
+	origPath := libraryPath
+	SetLibraryPath("/tmp")
 	t.Cleanup(func() {
-		DefaultSearchPaths = origPaths
+		libraryPath = origPath
 	})
 
 	db, err := sql.Open(DriverName, ":memory:")
@@ -878,28 +774,6 @@ func TestLibraryNotFound(t *testing.T) {
 	}
 }
 
-// TODO: remove this
-func TestModifyDefaultSearchPaths(t *testing.T) {
-	DefaultSearchPaths = []string{"."}
-	var wg sync.WaitGroup
-	for i := 0; i < 8; i++ {
-		wg.Add(1)
-		go func() {
-			defer wg.Done()
-			query := fmt.Sprintf(`SELECT REGEXP('%s', '%s');`, "abc", "abc")
-			db, close := InitDatabase(t)
-			defer close()
-			for i := 0; i < 30; i++ {
-				var ok bool
-				if err := db.QueryRow(query).Scan(&ok); err != nil {
-					t.Fatal(err)
-				}
-			}
-		}()
-	}
-	wg.Wait()
-}
-
 // WARN: bad benchmark
 func BenchmarkPCRE2(b *testing.B) {
 	db, cleanup := InitDatabase(b)
@@ -915,10 +789,33 @@ func BenchmarkPCRE2(b *testing.B) {
 		}
 	}
 
-	const query = "SELECT COUNT(*) FROM strings_table WHERE value REGEXP 'OO';"
+	patterns := [4]string{
+		"OO",
+		"ZZ",
+		"AA",
+		"MM",
+	}
+	var stmts [4]*sql.Stmt
+	b.Cleanup(func() {
+		for _, stmt := range stmts {
+			if stmt != nil {
+				stmt.Close()
+			}
+		}
+	})
+	for i, ptrn := range patterns {
+		query := fmt.Sprintf("SELECT COUNT(*) FROM strings_table WHERE value REGEXP '%s';", ptrn)
+		stmt, err := db.Prepare(query)
+		if err != nil {
+			b.Fatal(err)
+		}
+		stmts[i] = stmt
+	}
+
 	for i := 0; i < b.N; i++ {
 		var n int64
-		if err := db.QueryRow(query).Scan(&n); err != nil {
+		stmt := stmts[i%len(stmts)]
+		if err := stmt.QueryRow().Scan(&n); err != nil {
 			b.Fatal(err)
 		}
 	}
@@ -1051,7 +948,7 @@ func BenchmarkFindLibrary(b *testing.B) {
 	for i := 0; i < b.N; i++ {
 		// cacheKey(DefaultSearchPaths, LibExts)
 		// if _, err := findLibrary(DefaultSearchPaths); err != nil {
-		if _, err := findLibrariesCached(DefaultSearchPaths); err != nil {
+		if _, err := findLibrariesCached(SearchPaths()); err != nil {
 			b.Fatal(err)
 		}
 	}
