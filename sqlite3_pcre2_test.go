@@ -247,19 +247,42 @@ func TestEmptyRegex(t *testing.T) {
 	}
 }
 
+// Test PCRE2 specific regex groups.
+func TestExtendedRegex(t *testing.T) {
+	db, cleanup := InitDatabase(t)
+	t.Cleanup(cleanup)
+
+	InsertIntoStringsTable(t, db, "hello, world!")
+
+	// Positive lookbehind and lookahead
+	var rows int64
+	err := db.QueryRow("SELECT COUNT(*) FROM strings_table WHERE value REGEXP '(?<=hello).*(?=!)'").Scan(&rows)
+	if err != nil {
+		t.Fatal(err)
+	}
+	// Empty regex matches everything
+	if rows != 1 {
+		t.Fatalf("rows got %d want: %d", rows, 3)
+	}
+}
+
 func TestNullValues(t *testing.T) {
 	db, cleanup := InitDatabase(t)
 	t.Cleanup(cleanup)
 
 	InsertIntoStringsTable(t, db, "a", nil, "c", nil)
 
-	var rows int64
-	err := db.QueryRow("SELECT COUNT(*) FROM strings_table WHERE value REGEXP '^[ac]'").Scan(&rows)
-	if err != nil {
-		t.Fatal(err)
-	}
-	if rows != 2 {
-		t.Fatalf("rows got %d want: %d", rows, 2)
+	for _, fn := range []string{"REGEXP", "IREGEXP"} {
+		t.Run(fn, func(t *testing.T) {
+			var rows int64
+			err := db.QueryRow("SELECT COUNT(*) FROM strings_table WHERE " + fn + "('^[ac]', value)").Scan(&rows)
+			if err != nil {
+				t.Fatalf("%s: %v", fn, err)
+			}
+			if rows != 2 {
+				t.Fatalf("%s: rows got %d want: %d", fn, rows, 2)
+			}
+		})
 	}
 }
 
@@ -479,6 +502,24 @@ func TestIRegexpMatch(t *testing.T) {
 	testMatchTests(t, (MatchTest).IRegexp, iregexTests)
 }
 
+func TestMixedCaseRegexp(t *testing.T) {
+	db, cleanup := InitDatabase(t)
+	t.Cleanup(cleanup)
+	var ok bool
+	if err := db.QueryRow(`SELECT IREGEXP('A', 'a');`).Scan(&ok); err != nil {
+		t.Fatal(err)
+	}
+	if !ok {
+		t.Errorf("SELECT IREGEXP('a', 'A') = %t; want: %t", ok, true)
+	}
+	if err := db.QueryRow(`SELECT REGEXP('A', 'a');`).Scan(&ok); err != nil {
+		t.Fatal(err)
+	}
+	if ok {
+		t.Errorf("SELECT REGEXP('a', 'A') = %t; want: %t", ok, false)
+	}
+}
+
 func writeCols(t testing.TB, tw *tabwriter.Writer, args []string) {
 	if _, err := tw.Write([]byte(strings.Join(args, "\t") + "\n")); err != nil {
 		t.Fatal(err)
@@ -659,8 +700,6 @@ func TestHugePattern(t *testing.T) {
 	}
 }
 
-// (?:[a-z0-9!#$%&'*+/=?^_`{|}~-]+(?:\.[a-z0-9!#$%&'*+/=?^_`{|}~-]+)*|"(?:[\x01-\x08\x0b\x0c\x0e-\x1f\x21\x23-\x5b\x5d-\x7f]|\\[\x01-\x09\x0b\x0c\x0e-\x7f])*")@(?:(?:[a-z0-9](?:[a-z0-9-]*[a-z0-9])?\.)+[a-z0-9](?:[a-z0-9-]*[a-z0-9])?|\[(?:(?:(2(5[0-5]|[0-4][0-9])|1[0-9][0-9]|[1-9]?[0-9]))\.){3}(?:(2(5[0-5]|[0-4][0-9])|1[0-9][0-9]|[1-9]?[0-9])|[a-z0-9-]*[a-z0-9]:(?:[\x01-\x08\x0b\x0c\x0e-\x1f\x21-\x5a\x53-\x7f]|\\[\x01-\x09\x0b\x0c\x0e-\x7f])+)\])
-
 func TestComplexRegexp(t *testing.T) {
 	// https://stackoverflow.com/questions/201323/how-can-i-validate-an-email-address-using-a-regular-expression
 	const emailRe = `(?:[a-z0-9!#$%&'*+/=?^_` + "`" + `{|}~-]+(?:\.[a-z0-9!#$%&'*+/=?^_` + "`" + `{|}~-]+)*|"(?:[\x01-\x08\x0b\x0c\x0e-\x1f\x21\x23-\x5b\x5d-\x7f]|\\[\x01-\x09\x0b\x0c\x0e-\x7f])*")@(?:(?:[a-z0-9](?:[a-z0-9-]*[a-z0-9])?\.)+[a-z0-9](?:[a-z0-9-]*[a-z0-9])?|\[(?:(?:(2(5[0-5]|[0-4][0-9])|1[0-9][0-9]|[1-9]?[0-9]))\.){3}(?:(2(5[0-5]|[0-4][0-9])|1[0-9][0-9]|[1-9]?[0-9])|[a-z0-9-]*[a-z0-9]:(?:[\x01-\x08\x0b\x0c\x0e-\x1f\x21-\x5a\x53-\x7f]|\\[\x01-\x09\x0b\x0c\x0e-\x7f])+)\])`
@@ -770,6 +809,23 @@ func TestLibraryNotFound(t *testing.T) {
 		err := fn()
 		if !errors.Is(err, ErrLibraryNotFound) {
 			t.Errorf("%d: got error: %v want: %v", i, err, ErrLibraryNotFound)
+		}
+	}
+}
+
+func TestCacheExhaustion(t *testing.T) {
+	db, cleanup := InitDatabase(t)
+	t.Cleanup(cleanup)
+	long := strings.Repeat("a", 1024)
+	for i := 1; i < len(long); i++ {
+		s := long[:i]
+		query := fmt.Sprintf(`SELECT REGEXP('%s', '%s');`, s, long)
+		var ok bool
+		if err := db.QueryRow(query).Scan(&ok); err != nil {
+			t.Fatal(err)
+		}
+		if !ok {
+			t.Errorf("SELECT REGEXP('%s', '%s') = %t; want: %t", s, long, ok, true)
 		}
 	}
 }
