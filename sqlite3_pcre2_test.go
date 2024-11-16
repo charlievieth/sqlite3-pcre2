@@ -12,6 +12,8 @@ import (
 	"math"
 	"os"
 	"path/filepath"
+	"reflect"
+	"sort"
 	"strings"
 	"sync"
 	"testing"
@@ -41,24 +43,6 @@ func TestMain(m *testing.M) {
 	}
 	os.Exit(m.Run())
 }
-
-// var libraryPath string
-
-// func init() {
-// 	pwd, err := os.Getwd()
-// 	if err != nil {
-// 		panic(err)
-// 	}
-// 	libraryPath = filepath.Join(pwd, "../pcre2.dylib")
-// 	if _, err := os.Stat(libraryPath); err != nil {
-// 		panic(err)
-// 	}
-// 	sql.Register("sqlite3_with_regexp",
-// 		&sqlite3.SQLiteDriver{
-// 			Extensions: []string{libraryPath},
-// 		},
-// 	)
-// }
 
 // WARN: this must match MAX_DISPLAYED_PATTERN_LENGTH in pcre2.c
 const maxDisplayedPatternLength = 256
@@ -247,19 +231,42 @@ func TestEmptyRegex(t *testing.T) {
 	}
 }
 
+// Test PCRE2 specific regex groups.
+func TestExtendedRegex(t *testing.T) {
+	db, cleanup := InitDatabase(t)
+	t.Cleanup(cleanup)
+
+	InsertIntoStringsTable(t, db, "hello, world!")
+
+	// Positive lookbehind and lookahead
+	var rows int64
+	err := db.QueryRow("SELECT COUNT(*) FROM strings_table WHERE value REGEXP '(?<=hello).*(?=!)'").Scan(&rows)
+	if err != nil {
+		t.Fatal(err)
+	}
+	// Empty regex matches everything
+	if rows != 1 {
+		t.Fatalf("rows got %d want: %d", rows, 3)
+	}
+}
+
 func TestNullValues(t *testing.T) {
 	db, cleanup := InitDatabase(t)
 	t.Cleanup(cleanup)
 
 	InsertIntoStringsTable(t, db, "a", nil, "c", nil)
 
-	var rows int64
-	err := db.QueryRow("SELECT COUNT(*) FROM strings_table WHERE value REGEXP '^[ac]'").Scan(&rows)
-	if err != nil {
-		t.Fatal(err)
-	}
-	if rows != 2 {
-		t.Fatalf("rows got %d want: %d", rows, 2)
+	for _, fn := range []string{"REGEXP", "IREGEXP"} {
+		t.Run(fn, func(t *testing.T) {
+			var rows int64
+			err := db.QueryRow("SELECT COUNT(*) FROM strings_table WHERE " + fn + "('^[ac]', value)").Scan(&rows)
+			if err != nil {
+				t.Fatalf("%s: %v", fn, err)
+			}
+			if rows != 2 {
+				t.Fatalf("%s: rows got %d want: %d", fn, rows, 2)
+			}
+		})
 	}
 }
 
@@ -479,6 +486,24 @@ func TestIRegexpMatch(t *testing.T) {
 	testMatchTests(t, (MatchTest).IRegexp, iregexTests)
 }
 
+func TestMixedCaseRegexp(t *testing.T) {
+	db, cleanup := InitDatabase(t)
+	t.Cleanup(cleanup)
+	var ok bool
+	if err := db.QueryRow(`SELECT IREGEXP('A', 'a');`).Scan(&ok); err != nil {
+		t.Fatal(err)
+	}
+	if !ok {
+		t.Errorf("SELECT IREGEXP('a', 'A') = %t; want: %t", ok, true)
+	}
+	if err := db.QueryRow(`SELECT REGEXP('A', 'a');`).Scan(&ok); err != nil {
+		t.Fatal(err)
+	}
+	if ok {
+		t.Errorf("SELECT REGEXP('a', 'A') = %t; want: %t", ok, false)
+	}
+}
+
 func writeCols(t testing.TB, tw *tabwriter.Writer, args []string) {
 	if _, err := tw.Write([]byte(strings.Join(args, "\t") + "\n")); err != nil {
 		t.Fatal(err)
@@ -659,11 +684,14 @@ func TestHugePattern(t *testing.T) {
 	}
 }
 
-// (?:[a-z0-9!#$%&'*+/=?^_`{|}~-]+(?:\.[a-z0-9!#$%&'*+/=?^_`{|}~-]+)*|"(?:[\x01-\x08\x0b\x0c\x0e-\x1f\x21\x23-\x5b\x5d-\x7f]|\\[\x01-\x09\x0b\x0c\x0e-\x7f])*")@(?:(?:[a-z0-9](?:[a-z0-9-]*[a-z0-9])?\.)+[a-z0-9](?:[a-z0-9-]*[a-z0-9])?|\[(?:(?:(2(5[0-5]|[0-4][0-9])|1[0-9][0-9]|[1-9]?[0-9]))\.){3}(?:(2(5[0-5]|[0-4][0-9])|1[0-9][0-9]|[1-9]?[0-9])|[a-z0-9-]*[a-z0-9]:(?:[\x01-\x08\x0b\x0c\x0e-\x1f\x21-\x5a\x53-\x7f]|\\[\x01-\x09\x0b\x0c\x0e-\x7f])+)\])
-
 func TestComplexRegexp(t *testing.T) {
 	// https://stackoverflow.com/questions/201323/how-can-i-validate-an-email-address-using-a-regular-expression
-	const emailRe = `(?:[a-z0-9!#$%&'*+/=?^_` + "`" + `{|}~-]+(?:\.[a-z0-9!#$%&'*+/=?^_` + "`" + `{|}~-]+)*|"(?:[\x01-\x08\x0b\x0c\x0e-\x1f\x21\x23-\x5b\x5d-\x7f]|\\[\x01-\x09\x0b\x0c\x0e-\x7f])*")@(?:(?:[a-z0-9](?:[a-z0-9-]*[a-z0-9])?\.)+[a-z0-9](?:[a-z0-9-]*[a-z0-9])?|\[(?:(?:(2(5[0-5]|[0-4][0-9])|1[0-9][0-9]|[1-9]?[0-9]))\.){3}(?:(2(5[0-5]|[0-4][0-9])|1[0-9][0-9]|[1-9]?[0-9])|[a-z0-9-]*[a-z0-9]:(?:[\x01-\x08\x0b\x0c\x0e-\x1f\x21-\x5a\x53-\x7f]|\\[\x01-\x09\x0b\x0c\x0e-\x7f])+)\])`
+	const emailRe = `(?:[a-z0-9!#$%&'*+/=?^_` + "`" + `{|}~-]+(?:\.[a-z0-9!#$%&'` +
+		`*+/=?^_` + "`" + `{|}~-]+)*|"(?:[\x01-\x08\x0b\x0c\x0e-\x1f\x21\x23-\x5b\x5d-\x7f]` +
+		`|\\[\x01-\x09\x0b\x0c\x0e-\x7f])*")@(?:(?:[a-z0-9](?:[a-z0-9-]*[a-z0-9])?\.)+[a-z0-9]` +
+		`(?:[a-z0-9-]*[a-z0-9])?|\[(?:(?:(2(5[0-5]|[0-4][0-9])|1[0-9][0-9]|[1-9]?[0-9]))\.){3}` +
+		`(?:(2(5[0-5]|[0-4][0-9])|1[0-9][0-9]|[1-9]?[0-9])|[a-z0-9-]*[a-z0-9]:` +
+		`(?:[\x01-\x08\x0b\x0c\x0e-\x1f\x21-\x5a\x53-\x7f]|\\[\x01-\x09\x0b\x0c\x0e-\x7f])+)\])`
 	db, cleanup := InitDatabase(t)
 	t.Cleanup(cleanup)
 
@@ -681,14 +709,6 @@ func TestComplexRegexp(t *testing.T) {
 		`Abigail<@a,@b,@c:abigail@example.com>`,
 		`"This is a phrase"<abigail@example.com>`,
 	)
-
-	// Consider using this massive regex
-	//
-	// https://regex101.com/r/OmVWyR/1
-	//
-	// https://github.com/PCRE2Project/pcre2/blob/b73b3347673358795e86a99acad56d81c2e4fecd/testdata/testoutput2#L2234
-	//
-	// /(\d+(?:\s|$))(\d+(?:\s|$))(\d+(?:\s|$))(\d+(?:\s|$))(\d+(?:\s|$))(\d+(?:\s|$))(\d+(?:\s|$))(\d+(?:\s|$))(\d+(?:\s|$))(\d+(?:\s|$))(\d+(?:\s|$))(\d+(?:\s|$))(\d+(?:\s|$))(\d+(?:\s|$))(\d+(?:\s|$))(\d+(?:\s|$))(\d+(?:\s|$))(\d+(?:\s|$))(\d+(?:\s|$))(\d+(?:\s|$))(\d+(?:\s|$))(\d+(?:\s|$))(\d+(?:\s|$))(\d+(?:\s|$))(\d+(?:\s|$))(\d+(?:\s|$))(\d+(?:\s|$))(\d+(?:\s|$))(\d+(?:\s|$))(\d+(?:\s|$))(\d+(?:\s|$))(\d+(?:\s|$))(\d+(?:\s|$))(\d+(?:\s|$))(\d+(?:\s|$))(\d+(?:\s|$))(\d+(?:\s|$))(\d+(?:\s|$))(\d+(?:\s|$))(\d+(?:\s|$))(\d+(?:\s|$))(\d+(?:\s|$))(\d+(?:\s|$))(\d+(?:\s|$))(\d+(?:\s|$))(\d+(?:\s|$))(\d+(?:\s|$))(\d+(?:\s|$))(\d+(?:\s|$))(\d+(?:\s|$))(\d+(?:\s|$))(\d+(?:\s|$))(\d+(?:\s|$))(\d+(?:\s|$))(\d+(?:\s|$))(\d+(?:\s|$))(\d+(?:\s|$))(\d+(?:\s|$))(\d+(?:\s|$))(\d+(?:\s|$))(\d+(?:\s|$))(\d+(?:\s|$))(\d+(?:\s|$))(\d+(?:\s|$))(\d+(?:\s|$))(\d+(?:\s|$))(\d+(?:\s|$))(\d+(?:\s|$))(\d+(?:\s|$))(\d+(?:\s|$))(\d+(?:\s|$))(\d+(?:\s|$))(\d+(?:\s|$))(\d+(?:\s|$))(\d+(?:\s|$))(\d+(?:\s|$))(\d+(?:\s|$))(\d+(?:\s|$))(\d+(?:\s|$))(\d+(?:\s|$))(\d+(?:\s|$))(\d+(?:\s|$))(\d+(?:\s|$))(\d+(?:\s|$))(\d+(?:\s|$))(\d+(?:\s|$))(\d+(?:\s|$))(\d+(?:\s|$))(\d+(?:\s|$))(\d+(?:\s|$))(\d+(?:\s|$))(\d+(?:\s|$))(\d+(?:\s|$))(\d+(?:\s|$))(\d+(?:\s|$))(\d+(?:\s|$))(\d+(?:\s|$))(\d+(?:\s|$))(\d+(?:\s|$))(\d+(?:\s|$))(\d+(?:\s|$))(\d+(?:\s|$))(\d+(?:\s|$))(\d+(?:\s|$))(\d+(?:\s|$))(\d+(?:\s|$))(\d+(?:\s|$))(\d+(?:\s|$))(\d+(?:\s|$))(\d+(?:\s|$))(\d+(?:\s|$))(\d+(?:\s|$))(\d+(?:\s|$))(\d+(?:\s|$))(\d+(?:\s|$))(\d+(?:\s|$))(\d+(?:\s|$))(\d+(?:\s|$))(\d+(?:\s|$))(\d+(?:\s|$))(\d+(?:\s|$))(\d+(?:\s|$))(\d+(?:\s|$))(\d+(?:\s|$))(\d+(?:\s|$))(\d+(?:\s|$))(\d+(?:\s|$))(\d+(?:\s|$))(\d+(?:\s|$))(\d+(?:\s|$))(\d+(?:\s|$))(\d+(?:\s|$))(\d+(?:\s|$))(\d+(?:\s|$))(\d+(?:\s|$))(\d+(?:\s|$))(\d+(?:\s|$))(\d+(?:\s|$))(\d+(?:\s|$))(\d+(?:\s|$))(\d+(?:\s|$))(\d+(?:\s|$))(\d+(?:\s|$))(\d+(?:\s|$))(\d+(?:\s|$))(\d+(?:\s|$))(\d+(?:\s|$))(\d+(?:\s|$))(\d+(?:\s|$))(\d+(?:\s|$))(\d+(?:\s|$))(\d+(?:\s|$))(\d+(?:\s|$))(\d+(?:\s|$))(\d+(?:\s|$))(\d+(?:\s|$))(\d+(?:\s|$))(\d+(?:\s|$))(\d+(?:\s|$))(\d+(?:\s|$))(\d+(?:\s|$))(\d+(?:\s|$))(\d+(?:\s|$))(\d+(?:\s|$))(\d+(?:\s|$))(\d+(?:\s|$))(\d+(?:\s|$))(\d+(?:\s|$))(\d+(?:\s|$))(\d+(?:\s|$))(\d+(?:\s|$))(\d+(?:\s|$))(\d+(?:\s|$))(\d+(?:\s|$))(\d+(?:\s|$))(\d+(?:\s|$))(\d+(?:\s|$))(\d+(?:\s|$))(\d+(?:\s|$))(\d+(?:\s|$))(\d+(?:\s|$))(\d+(?:\s|$))(\d+(?:\s|$))(\d+(?:\s|$))(\d+(?:\s|$))(\d+(?:\s|$))(\d+(?:\s|$))(\d+(?:\s|$))(\d+(?:\s|$))(\d+(?:\s|$))(\d+(?:\s|$))(\d+(?:\s|$))(\d+(?:\s|$))(\d+(?:\s|$))(\d+(?:\s|$))(\d+(?:\s|$))(\d+(?:\s|$))(\d+(?:\s|$))(\d+(?:\s|$))(\d+(?:\s|$))(\d+(?:\s|$))(\d+(?:\s|$))(\d+(?:\s|$))(\d+(?:\s|$))(\d+(?:\s|$))(\d+(?:\s|$))(\d+(?:\s|$))(\d+(?:\s|$))(\d+(?:\s|$))(\d+(?:\s|$))(\d+(?:\s|$))(\d+(?:\s|$))(\d+(?:\s|$))(\d+(?:\s|$))(\d+(?:\s|$))(\d+(?:\s|$))(\d+(?:\s|$))(\d+(?:\s|$))(\d+(?:\s|$))(\d+(?:\s|$))(\d+(?:\s|$))(\d+(?:\s|$))(\d+(?:\s|$))(\d+(?:\s|$))(\d+(?:\s|$))(\d+(?:\s|$))(\d+(?:\s|$))(\d+(?:\s|$))(\d+(?:\s|$))(\d+(?:\s|$))(\d+(?:\s|$))(\d+(?:\s|$))(\d+(?:\s|$))(\d+(?:\s|$))(\d+(?:\s|$))(\d+(?:\s|$))(\d+(?:\s|$))(\d+(?:\s|$))(\d+(?:\s|$))(\d+(?:\s|$))(\d+(?:\s|$))(\d+(?:\s|$))(\d+(?:\s|$))(\d+(?:\s|$))(\d+(?:\s|$))(\d+(?:\s|$))(\d+(?:\s|$))(\d+(?:\s|$))(\d+(?:\s|$))(\d+(?:\s|$))(\d+(?:\s|$))(\d+(?:\s|$))(\d+(?:\s|$))(\d+(?:\s|$))(\d+(?:\s|$))(\d+(?:\s|$))(\d+(?:\s|$))(\d+(?:\s|$))(\d+(?:\s|$))(\d+(?:\s|$))(\d+(?:\s|$))(\d+(?:\s|$))(\d+(?:\s|$))(\d+(?:\s|$))(\d+(?:\s|$))(\d+(?:\s|$))(\d+(?:\s|$))(\d+(?:\s|$))(\d+(?:\s|$))(\w+)\s+(\270)/I
 
 	// Another option is to use `b*` repeated 9,000 times (this is too big for the JIT)
 	// https://github.com/PCRE2Project/pcre2/blob/b73b3347673358795e86a99acad56d81c2e4fecd/testdata/testoutput17#L16
@@ -770,6 +790,117 @@ func TestLibraryNotFound(t *testing.T) {
 		err := fn()
 		if !errors.Is(err, ErrLibraryNotFound) {
 			t.Errorf("%d: got error: %v want: %v", i, err, ErrLibraryNotFound)
+		}
+	}
+}
+
+func anySlice[S ~[]E, E any](s S) []any {
+	a := make([]any, len(s))
+	for i := range s {
+		a[i] = s[i]
+	}
+	return a
+}
+
+// That that query with more regex expressions than the size of the cache works.
+// TODO: we should also test that this does not thrash the cache.
+func TestQueryManyRegexeExpressions(t *testing.T) {
+	db, cleanup := InitDatabase(t)
+	t.Cleanup(cleanup)
+
+	if _, err := db.Exec("SELECT REGEXP_INFO('reset_stats');"); err != nil {
+		t.Fatal(err)
+	}
+
+	stat := func(name string) int {
+		t.Helper()
+		var v int
+		if err := db.QueryRow("SELECT REGEXP_INFO(?);", name).Scan(&v); err != nil {
+			t.Fatal(err)
+		}
+		return v
+	}
+
+	cacheSize := stat("cache_size")
+	if cacheSize <= 0 {
+		t.Fatal("non-positive cache size:", cacheSize)
+	}
+	var values []string
+loop:
+	for i := 1; ; i++ {
+		for r := 'A'; r <= 'Z'; r++ {
+			values = append(values, strings.Repeat(string(r), i))
+			if len(values) >= cacheSize*2 {
+				break loop
+			}
+		}
+	}
+	InsertIntoStringsTable(t, db, anySlice(values)...)
+
+	var a []string
+	for _, s := range values {
+		a = append(a, `REGEXP('^`+s+`$', value)`)
+	}
+	query := `
+	SELECT
+		value
+	FROM
+		strings_table
+	WHERE
+		` + strings.Join(a, "\n\t\tOR ") + `;`
+	t.Logf("Query:\n%s", query)
+
+	rows, err := db.Query(query)
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer rows.Close()
+
+	var got []string
+	for rows.Next() {
+		var s string
+		if err := rows.Scan(&s); err != nil {
+			t.Fatal(err)
+		}
+		got = append(got, s)
+	}
+	if err := rows.Err(); err != nil {
+		t.Fatal(err)
+	}
+	sort.Strings(values)
+	sort.Strings(got)
+	if !reflect.DeepEqual(values, got) {
+		t.Fatalf("mismatch\ngot:  %q\nwant: %q", got, values)
+	}
+
+	if n := stat("cache_in_use"); n != cacheSize {
+		t.Errorf("Expected the entire cache (%d entries) to be in use instead "+
+			"only %d entries are stored", cacheSize, n)
+	}
+	if n := stat("regexes_compiled"); n != cacheSize*2 {
+		t.Errorf("Expected %d regexes to be compiled got: %d", cacheSize*2, n)
+	}
+
+	// Print stats
+	for _, name := range []string{"cache_evacuations", "cache_hits", "cache_misses",
+		"cache_in_use", "regexes_compiled"} {
+		t.Logf("%s: %d\n", name, stat(name))
+	}
+}
+
+func TestCacheExhaustion(t *testing.T) {
+	db, cleanup := InitDatabase(t)
+	t.Cleanup(cleanup)
+	long := strings.Repeat("a", 1024)
+	for i := 1; i < len(long); i++ {
+		s := long[:i]
+		query := fmt.Sprintf(`SELECT REGEXP('%s', '%s');`, s, long)
+		var ok bool
+		if err := db.QueryRow(query).Scan(&ok); err != nil {
+			t.Fatal(err)
+		}
+		if !ok {
+			t.Errorf("SELECT REGEXP('%s', '%s') = %t; want: %t", s, long, ok, true)
 		}
 	}
 }

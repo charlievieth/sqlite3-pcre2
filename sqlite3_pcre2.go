@@ -233,6 +233,13 @@ func findLibrariesCached(paths []string) ([]string, error) {
 	return libs, nil
 }
 
+// Sqlite3ConnectHook is the connection hook for sqlite3.
+//
+// Usage:
+//
+//	sql.Register("NAME", &sqlite3.SQLiteDriver{
+//		ConnectHook: Sqlite3ConnectHook,
+//	})
 func Sqlite3ConnectHook(conn *sqlite3.SQLiteConn) error {
 	paths := SearchPaths()
 	libs, err := findLibrariesCached(paths)

@@ -1,5 +1,9 @@
 # vim: ts=4 sw=4
 
+# WARN: this Makefile is a mess and in serious need of cleanup.
+# At some point, this project will be updated to use CMake (once
+# I learn to stop fighting it) or meson.
+
 MAJVER=  0
 MINVER=  0
 RELVER=  1
@@ -24,6 +28,7 @@ SQLITE3_LIBS =
 ##############################################################################
 
 DEFAULT_CC = cc
+# DEFAULT_CC = gcc-14
 DEFAULT_CXX = g++
 CC = $(DEFAULT_CC)
 CXX = $(DEFAULT_CXX)
@@ -105,6 +110,10 @@ CFLAGS += -Wno-sign-conversion
 CFLAGS += -Wwrite-strings
 CFLAGS += -Winline
 
+# TODO: consider adding
+# -minline-stringops-dynamically
+# -minline-all-stringops
+
 # WARN: debug (and gcc) only
 # CFLAGS += -Wno-aggressive-loop-optimizations
 # CFLAGS += -Wvector-operation-performance
@@ -164,13 +173,13 @@ dist: clean
 .PHONY: test
 test: CFLAGS+=-DMAX_DISPLAYED_PATTERN_LENGTH=256
 test: build
-	@SQLITE3_PCRE2_LIBRARY=$(TARGET_DEP) go test $(GOTAGS)
+	SQLITE3_PCRE2_LIBRARY=$(TARGET_DEP) go test $(GOTAGS)
 
 # TODO: reuse make targets
 .PHONY: testrace
 testrace: CFLAGS+=-DMAX_DISPLAYED_PATTERN_LENGTH=256
 testrace: build
-	@SQLITE3_PCRE2_LIBRARY=$(TARGET_DEP) go test $(GOTAGS)
+	@SQLITE3_PCRE2_LIBRARY=$(TARGET_DEP) go test $(GOTAGS) -race
 
 # TODO: reuse make targets
 .PHONY: shorttest
