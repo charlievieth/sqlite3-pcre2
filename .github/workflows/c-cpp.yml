@@ -1,0 +1,25 @@
+name: Test
+
+on:
+  push:
+    branches: [ "master" ]
+  pull_request:
+    branches: [ "master" ]
+
+jobs:
+  build:
+
+    runs-on: ubuntu-latest
+
+    steps:
+    - uses: actions/checkout@v4
+    - name: install sqlite3
+      run: sudo apt-get install libsqlite3-dev
+    - name: make
+      run: make
+    - name: make test
+      run: make test
+    - name: make testrace
+      run: make testrace
+    - name: make test_pcre2
+      run: make test_pcre2
