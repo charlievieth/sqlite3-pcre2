@@ -565,10 +565,6 @@ static void regexp_execute(sqlite3_context *ctx, sqlite3_value *pval,
 		return;
 	}
 
-	// TODO: do what grep does and check if the pattern matches
-	// an empty string when compiling.
-	//
-	// TODO: handle zero length subjects?
 	int subject_len = sqlite3_value_bytes(sval);
 
 	const char *subject = subject_type == SQLITE_BLOB
