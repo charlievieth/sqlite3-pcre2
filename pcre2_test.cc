@@ -3,6 +3,10 @@
 //go:build never
 // +build never
 
+// This is a very simple test suite for the pcre2 extension and exists mostly
+// to run the address sanitizer to find leaks, which we can't do with the Go
+// test suite.
+
 #include <sqlite3.h>
 
 #include <fstream>
@@ -32,15 +36,6 @@ static void check_sqlite3_response_impl(int code, int line) {
 		}                                                              \
 	} while (0)
 
-
-// TODO: use boot_ids table !!!
-constexpr char create_tables_stmt[] = R"""(
-CREATE TABLE IF NOT EXISTS strings_table (
-    id    INTEGER PRIMARY KEY,
-    value TEXT
-);
-)""";
-
 sqlite3 *init_test_database() {
 	char *errmsg = NULL;
 	#define _(code) assert_sqlite3(code)
@@ -52,24 +47,11 @@ sqlite3 *init_test_database() {
 	_(sqlite3_open_v2("file:./test_c.sqlite3", &db, opts, NULL));
 
 	_(sqlite3_enable_load_extension(db, 1));
-	_(sqlite3_load_extension(db, "sqlite3_pcre2.dylib", "sqlite3_sqlitepcre_init", &errmsg));
+	_(sqlite3_load_extension(db, "./sqlite3_pcre2", "sqlite3_sqlitepcre_init", &errmsg));
 
-	// "SELECT REGEXP('%s', '%s');"
-
-	// TODO: use "SELECT REGEXP(pattern, subject)"
-	// _(sqlite3_exec(db, create_tables_stmt, NULL, NULL, &errmsg));
-	// _(sqlite3_exec(db, "DELETE FROM strings_table;", NULL, NULL, &errmsg));
 	#undef _
 	return db;
 }
-
-// static int exec_callback(void *data, int n, char **results, char **columns) {
-// 	(void)data;
-// 	printf("n: %d\n", n);
-// 	printf("result: %s\n", results[0]);
-// 	printf("column: %s\n", columns[0]);
-// 	return SQLITE_WARNING;
-// }
 
 constexpr const char * bool_to_string(bool b){
 	return b ? "true" : "false";
@@ -110,39 +92,6 @@ static bool test_regex(sqlite3 *db, bool caseless) {
 	char *errmsg = NULL;
 	for (auto test : regexTests) {
 		std::string query = format_regex_query(test.pattern, test.subject, caseless);
-		const char *q = query.c_str();
-
-		int ret = sqlite3_exec(db, q, exec_callback, &match, &errmsg);
-		if (ret != SQLITE_OK) {
-			std::printf("Error: %s: %d: %s\n", q, ret, errmsg);
-			passed = false;
-			continue;
-		}
-		if (match != test.match) {
-			std::printf("Error: %s = %s want: %s\n", q, bool_to_string(match),
-				bool_to_string(test.match));
-			passed = false;
-		}
-	}
-	return passed;
-}
-
-static bool test_regex_parallel(sqlite3 *db) {
-	// auto fn = [](void *data, int n, char **results, char **columns) -> int {
-	// 	(void)columns;
-	// 	bool *match = static_cast<bool*>(data);
-	// 	*match = !!(n == 1 && results && std::strcmp(results[0], "1") == 0);
-	// 	return SQLITE_OK;
-	// };
-
-	// TODO: consider inserting data and actually using the database for this.
-
-	bool match = false;
-	bool passed = true;
-	char *errmsg = NULL;
-
-	for (auto test : regexTests) {
-		std::string query = format_regex_query(test.pattern, test.subject);
 		const char *q = query.c_str();
 
 		int ret = sqlite3_exec(db, q, exec_callback, &match, &errmsg);

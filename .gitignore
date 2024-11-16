@@ -2,8 +2,10 @@
 /.cache
 /tmp
 /sqlite3-pcre2.test
+/pcre2_test
 *.dylib
 *.dylib.dSYM
+*.so
 *.plist
 *.dSYM
 .clang-format
