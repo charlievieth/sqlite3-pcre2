@@ -147,7 +147,7 @@ $(TARGET_DEP): pcre2.c
 
 # WARN: split C/C++ flags
 $(TEST_DEP): pcre2_test.cc
-	${CXX} -o $@ ${CFLAGS} -std=c++20 ${LIBS} pcre2_test.cc
+	${CXX} -o $@ ${CFLAGS} -std=c++20 pcre2_test.cc ${LIBS}
 
 build: $(TARGET_DEP) $(TEST_DEP)
 
