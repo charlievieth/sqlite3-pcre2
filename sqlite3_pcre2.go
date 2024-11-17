@@ -1,7 +1,9 @@
 // Package pcre2 registers a sqlite3 PCRE2 extension for use with
 // github.com/mattn/go-sqlite3.
 //
-// TODO: note that this adds the REGEX and non-standard IREGEX functions.
+// This adds the REGEXP and IREGEXP (case-insensitive) functions to
+// sqlite3. Both functions use PCRE2 for matching, and if available,
+// will JIT compile the PCRE2 code before use.
 package pcre2
 
 import (
