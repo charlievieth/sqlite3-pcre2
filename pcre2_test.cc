@@ -53,10 +53,6 @@ sqlite3 *init_test_database() {
 	return db;
 }
 
-constexpr const char * bool_to_string(bool b){
-	return b ? "true" : "false";
-}
-
 struct RegexTest {
 	std::string pattern;
 	std::string subject;
@@ -70,6 +66,96 @@ static const RegexTest regexTests[] = {
 	{"日本語+", "日本語語", true},
 	{"日本語+", "日本語a", true},
 	{"日本語+", "日本a語", false},
+
+	{"", "", true},
+	{"^abcdefg", "abcdefg", true},
+	{"a+", "baaab", true},
+	{"abcd..", "abcdef", true},
+	{"a", "a", true},
+	{"x", "y", false},
+	{"b", "abc", true},
+	{".", "a", true},
+	{".*", "abcdef", true},
+	{"^", "abcde", true},
+	{"$", "abcde", true},
+	{"^abcd$", "abcd", true},
+	{"^abcd$", "abcde", false},
+	{"a+", "baaab", true},
+	{"a*", "baaab", true},
+	{"[a-z]+", "abcd", true},
+	{"[^a-z]+", "ab1234cd", true},
+	{"[a\\-\\]z]+", "az]-bcz", true},
+	{"[^\n]+", "abcd\n", true},
+	{"[日本語]+", "日本語日本語", true},
+	{"日本語+", "日本語", true},
+	{"日本語+", "日本語語語語", true},
+	{"()", "", true},
+	{"(a)", "a", true},
+	{"(.)(.)", "日a", true},
+	{"(.*)", "", true},
+	{"(.*)", "abcd", true},
+	{"(..)(..)", "abcd", true},
+	{"(([^xyz]*)(d))", "abcd", true},
+	{"((a|b|c)*(d))", "abcd", true},
+	{"(((a|b|c)*)(d))", "abcd", true},
+	{"\a\f\n\r\t\v", "\a\f\n\r\t\v", true},
+	{"[\a\f\n\r\t\v]+", "\a\f\n\r\t\v", true},
+
+	{"a*(|(b))c*", "aacc", true},
+	{"(.*).*", "ab", true},
+	{"[.]", ".", true},
+	{"/$", "/abc/", true},
+	{"/$", "/abc", false},
+
+	// multiple matches
+	{".", "abc", true},
+	{"(.)", "abc", true},
+	{".(.)", "abcd", true},
+	{"ab*", "abbaab", true},
+	{"a(b*)", "abbaab", true},
+
+	// fixed bugs
+	{"ab$", "cab", true},
+	{"axxb$", "axxcb", false},
+	{"data", "daXY data", true},
+	{"da(.)a$", "daXY data", true},
+	{"zx+", "zzx", true},
+	{"ab$", "abcab", true},
+	{"(aa)*$", "a", true},
+	{"(?:.|(?:.a))", "", false},
+	{"(?:A(?:A|a))", "Aa", true},
+	{"(?:A|(?:A|a))", "a", true},
+	{"(a){0}", "", true},
+	{"(?-s)(?:(?:^).)", "\n", false},
+	{"(?s)(?:(?:^).)", "\n", true},
+	{"(?:(?:^).)", "\n", false},
+	{"\\b", "x", true},
+	{"\\b", "xx", true},
+	{"\\b", "x y", true},
+	{"\\b", "xx yy", true},
+	{"\\B", "x", false},
+	{"\\B", "xx", true},
+	{"\\B", "x y", false},
+	{"\\B", "xx yy", true},
+	{"(|a)*", "aa", true},
+
+	// long set of matches (longer than startSize)
+	{".", "qwertyuiopasdfghjklzxcvbnm1234567890", true},
+
+	// Empty matches
+	{"", "", true},
+	{"^$", "", true},
+	{"^", "", true},
+	{"$", "", true},
+	{"a", "", false},
+	{" ", "", false},
+
+	// Unicode fun
+	{"🙈.*🙉.*🙊", "😈 🙈 🙉 🙊 😈", true},
+	{"🙈.*🙉[^a]+🙊", "😈 🙈 🙉 a 🙊 😈", false},
+	{"🙈.+🙉.+🙊", "😈 🙈 🙉 🙊 😈", true},
+	{"🙈.+🙉.+🙊", "🙈🙉🙊", false},
+	{"🙈\\s+🙉\\s+🙊", " 🙈 🙉 🙊 ", true},
 };
 
 static int exec_callback(void *data, int n, char **results, char **columns) {
@@ -84,6 +170,10 @@ static std::string format_regex_query(std::string pattern, std::string subject, 
 		return "SELECT IREGEXP('" + pattern + "', '" + subject + "');";
 	}
 	return "SELECT REGEXP('" + pattern + "', '" + subject + "');";
+}
+
+constexpr const char * bool_to_string(bool b){
+	return b ? "true" : "false";
 }
 
 static bool test_regex(sqlite3 *db, bool caseless) {

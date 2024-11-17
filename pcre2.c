@@ -35,18 +35,21 @@ SQLITE_EXTENSION_INIT1
 HEDLEY_STATIC_ASSERT(1 <= CACHE_SIZE && CACHE_SIZE <= 1024, "invalid CACHE_SIZE");
 
 // Start size of the pcre2 JIT stack.
+//
+// Must be greater than zero otherwise pcre2_jit_stack_create returns a null
+// JIT stack, which defeats the purpose of having a max JIT stack size.
 #ifndef JIT_STACK_START_SIZE
-#define JIT_STACK_START_SIZE (0)
+#define JIT_STACK_START_SIZE (32 * 1024LU)
 #endif
-
-HEDLEY_STATIC_ASSERT(JIT_STACK_START_SIZE >= 0, "invalid JIT_STACK_START_SIZE");
+HEDLEY_STATIC_ASSERT(JIT_STACK_START_SIZE > 0,
+	"JIT_STACK_START_SIZE must be greater than zero");
 
 // Maximum size of the pcre2 JIT stack.
 #ifndef JIT_STACK_MAX_SIZE
 #define JIT_STACK_MAX_SIZE (512 * 1024LU)
 #endif
-
-HEDLEY_STATIC_ASSERT(JIT_STACK_START_SIZE <= JIT_STACK_MAX_SIZE, "invalid JIT_STACK_MAX_SIZE");
+HEDLEY_STATIC_ASSERT(JIT_STACK_START_SIZE <= JIT_STACK_MAX_SIZE,
+	"JIT_STACK_MAX_SIZE must be larger than JIT_STACK_START_SIZE");
 
 #define noinline HEDLEY_NEVER_INLINE
 
@@ -219,6 +222,9 @@ static cache_list *cache_list_init(void) {
 	}
 	memset(list, 0, sizeof(cache_list));
 
+	// Create a general context that uses sqlite3's memory allocator instead of
+	// the system default. This simplifies the tracking of memory used.
+	//
 	// clang-format off
 	list->general_context = pcre2_general_context_create(
 		re_pcre2_malloc,
@@ -264,11 +270,10 @@ static int cache_list_init_jit_stack(cache_list *cache) {
 		JIT_STACK_MAX_SIZE,
 		cache->general_context
 	);
-	if (JIT_STACK_START_SIZE > 0 && JIT_STACK_MAX_SIZE > 0) {
-		if (cache->jit_stack == NULL) {
-			return 1;
-		}
+	if (cache->jit_stack == NULL) {
+		return 1;
 	}
+
 	cache->context = pcre2_match_context_create(cache->general_context);
 	if (cache->context == NULL) {
 		return 1;
@@ -288,6 +293,7 @@ static void cache_list_free(cache_list *list) {
 		return;
 	}
 	if (list->general_context) {
+		pcre2_jit_free_unused_memory(list->general_context);
 		pcre2_general_context_free(list->general_context);
 	}
 	if (list->compile_context) {
@@ -302,10 +308,11 @@ static void cache_list_free(cache_list *list) {
 	if (list->match_data) {
 		pcre2_match_data_free(list->match_data);
 	}
-	for (cache_entry *e = list->root.next; e != &list->root; e = e->next) {
-		if (e->pattern != NULL) {
-			cache_entry_free(e);
-		}
+	for (cache_entry *e = list->root.next; e != &list->root; ) {
+		cache_entry *next = e->next;
+		cache_entry_free(e);
+		re_free(e);
+		e = next;
 	}
 #ifndef NDEBUG
 	// Zero when debugging to detect "use after free" errors
